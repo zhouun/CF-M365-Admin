@@ -19,6 +19,8 @@ const DEFAULT_CONFIG = {
   protectedUsers: [], // legacy: full UPN list (deprecated)
   protectedPrefixes: ['admin', 'superadmin', 'root', 'administrator', 'sysadmin', 'owner', 'support', 'helpdesk'],
   invite: { enabled: false },
+  customFooter: { enabled: false, content: '' },
+  skuDisplayMode: 'remaining', // 'remaining' | 'used' | 'none'
 };
 
 const GITHUB_LINK = 'https://github.com/zixiwangluo/CF-M365-Admin';
@@ -62,6 +64,7 @@ function mergeConfig(raw) {
 
   cfg.turnstile = { ...base.turnstile, ...(raw.turnstile || {}) };
   cfg.invite = { ...base.invite, ...(raw.invite || {}) };
+  cfg.customFooter = { ...base.customFooter, ...(raw.customFooter || {}) };
 
   cfg.globals = Array.isArray(raw.globals) ? raw.globals : base.globals;
   cfg.protectedUsers = Array.isArray(raw.protectedUsers) ? raw.protectedUsers : base.protectedUsers;
@@ -70,6 +73,7 @@ function mergeConfig(raw) {
   cfg.adminUsername = (raw.adminUsername || base.adminUsername || 'admin').toString().trim() || 'admin';
   cfg.adminPath = (raw.adminPath || base.adminPath || '/admin').toString().trim() || '/admin';
   cfg.adminPasswordHash = (raw.adminPasswordHash || base.adminPasswordHash || '').toString();
+  cfg.skuDisplayMode = ['remaining', 'used', 'none'].includes(raw.skuDisplayMode) ? raw.skuDisplayMode : 'remaining';
 
   return cfg;
 }
@@ -136,14 +140,14 @@ function disableSelectIfSingle(arr) {
   return arr.length <= 1;
 }
 
-function checkPasswordComplexity(pwd){
-  if(!pwd || pwd.length<8) return false;
-  let s=0;
-  if(/[a-z]/.test(pwd)) s++;
-  if(/[A-Z]/.test(pwd)) s++;
-  if(/\d/.test(pwd)) s++;
-  if(/[^a-zA-Z0-9]/.test(pwd)) s++;
-  return s>=3;
+function checkPasswordComplexity(pwd) {
+  if (!pwd || pwd.length < 8) return false;
+  let s = 0;
+  if (/[a-z]/.test(pwd)) s++;
+  if (/[A-Z]/.test(pwd)) s++;
+  if (/\d/.test(pwd)) s++;
+  if (/[^a-zA-Z0-9]/.test(pwd)) s++;
+  return s >= 3;
 }
 
 /* -------------------- HTML Templates -------------------- */
@@ -169,6 +173,15 @@ const baseStyles = `
     @keyframes gradient { 0% {background-position:0% 50%} 50% {background-position:100% 50%} 100% {background-position:0% 50%} }
     @keyframes fadeInUp { from {opacity:0; transform: translateY(20px);} to {opacity:1; transform: translateY(0);} }
     a { color: var(--primary); text-decoration: none; }
+    .custom-footer-text { margin-top: 16px; text-align: center; font-size: 14px; line-height: 1.6; }
+    .custom-footer-text, .custom-footer-text a {
+        background: var(--bg-gradient);
+        background-size: 400% 400%;
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        animation: gradient 15s ease infinite;
+        font-weight: 600;
+    }
     .card {
         background: var(--glass-bg);
         backdrop-filter: blur(12px);
@@ -238,6 +251,7 @@ function renderRegisterPage({
   turnstileSiteKey,
   inviteMode,
   adminPath,
+  customFooter,
 }) {
   const disableGlobal = disableSelectIfSingle(globals);
   const selectedGlobal = globals.find(g => g.id === selectedGlobalId) || globals[0] || null;
@@ -376,13 +390,12 @@ ${siteKeyScript}
       <div class="hint" id="pwdHint">密码需满足：长度 ≥ 8，且大写/小写/数字/符号四类中满足任意三类。</div>
     </div>
 
-    ${
-      inviteMode
-        ? `<div class="input-group">
+    ${inviteMode
+      ? `<div class="input-group">
             <span class="label">邀请码</span>
             <input type="text" id="inviteCode" required placeholder="请输入有效邀请码">
            </div>`
-        : ''
+      : ''
     }
 
     ${turnstileSiteKey ? `<div class="cf-turnstile" data-sitekey="${turnstileSiteKey}"></div>` : ''}
@@ -390,6 +403,8 @@ ${siteKeyScript}
     <button type="submit" id="btn">立即创建账号</button>
     <div id="msg" class="message"></div>
   </form>
+
+  ${customFooter?.enabled && customFooter?.content ? `<div class="custom-footer-text">${customFooter.content}</div>` : ''}
 
   <div class="footer">
     <span>Powered by Cloudflare Workers</span>
@@ -401,7 +416,7 @@ ${siteKeyScript}
 <script>
   const globals = ${JSON.stringify(globals)};
   const selectedGlobalId = ${JSON.stringify(selectedGlobal ? selectedGlobal.id : '')};
-  const protectedPrefixes = ${JSON.stringify((protectedPrefixes || []).map(s=>String(s).toLowerCase()))};
+  const protectedPrefixes = ${JSON.stringify((protectedPrefixes || []).map(s => String(s).toLowerCase()))};
   const inviteMode = ${inviteMode ? 'true' : 'false'};
   const turnstileOn = ${turnstileSiteKey ? 'true' : 'false'};
 
@@ -648,10 +663,10 @@ label.inline{display:flex;align-items:center;gap:8px;margin:6px 0;}
     <a href="https://github.com/zixiwangluo/CF-M365-Admin" target="_blank" style="display:flex;align-items:center;gap:6px;">${GITHUB_ICON}<span>GitHub CF-M365-Admin</span></a>
   </div>
   <div class="tabs">
-    <a class="tab ${active==='users'?'active':''}" href="${adminPath}/users">用户</a>
-    <a class="tab ${active==='globals'?'active':''}" href="${adminPath}/globals">全局账户</a>
-    <a class="tab ${active==='invites'?'active':''}" href="${adminPath}/invites">邀请码</a>
-    <a class="tab ${active==='settings'?'active':''}" href="${adminPath}/settings">设置</a>
+    <a class="tab ${active === 'users' ? 'active' : ''}" href="${adminPath}/users">用户</a>
+    <a class="tab ${active === 'globals' ? 'active' : ''}" href="${adminPath}/globals">全局账户</a>
+    <a class="tab ${active === 'invites' ? 'active' : ''}" href="${adminPath}/invites">邀请码</a>
+    <a class="tab ${active === 'settings' ? 'active' : ''}" href="${adminPath}/settings">设置</a>
   </div>
 </div>
 <div class="container">
@@ -1532,9 +1547,26 @@ function renderSettingsPage(adminPath, cfg) {
 <div class="section">
   <h3 style="margin-top:0;">基础设置</h3>
   <div class="row"><span class="label">后台路径</span><input id="sPath" value="${cfg.adminPath}" placeholder="/admin"></div>
-  <div class="row"><span class="label">Turnstile Site Key (留空关闭)</span><input id="sSite" value="${cfg.turnstile.siteKey||''}"></div>
-  <div class="row"><span class="label">Turnstile Secret Key (留空关闭)</span><input id="sSecret" value="${cfg.turnstile.secretKey||''}"></div>
-  <div class="row"><label class="inline"><input type="checkbox" id="sInvite" ${cfg.invite?.enabled?'checked':''}> 启用邀请码注册</label></div>
+  <div class="row"><span class="label">Turnstile Site Key (留空关闭)</span><input id="sSite" value="${cfg.turnstile.siteKey || ''}"></div>
+  <div class="row"><span class="label">Turnstile Secret Key (留空关闭)</span><input id="sSecret" value="${cfg.turnstile.secretKey || ''}"></div>
+  <div class="row"><label class="inline"><input type="checkbox" id="sInvite" ${cfg.invite?.enabled ? 'checked' : ''}> 启用邀请码注册</label></div>
+</div>
+
+<div class="section">
+  <h3 style="margin-top:0;">界面定制</h3>
+  <div class="row">
+    <span class="label">前台注册页订阅数量显示方式</span>
+    <select id="sSkuDisplayMode">
+      <option value="remaining" ${cfg.skuDisplayMode === 'remaining' ? 'selected' : ''}>显示剩余总量（默认）</option>
+      <option value="used" ${cfg.skuDisplayMode === 'used' ? 'selected' : ''}>显示已注册人数</option>
+      <option value="none" ${cfg.skuDisplayMode === 'none' ? 'selected' : ''}>隐藏数量仅显示订阅名</option>
+    </select>
+  </div>
+  <div class="row" style="margin-top:8px;"><label class="inline"><input type="checkbox" id="sFooterOn" ${cfg.customFooter?.enabled ? 'checked' : ''}> 启用注册页底部自定义内容</label></div>
+  <div class="row" style="margin-top:8px;">
+    <span class="label">自定义内容 (支持普通文本与 HTML 标签，如 &lt;a&gt;)</span>
+    <textarea id="sFooterContent" rows="3" placeholder="例如：&lt;a href='https://example.com' target='_blank' style='color:var(--primary);font-weight:600;text-decoration:none;'&gt;联系我们&lt;/a&gt;">${cfg.customFooter?.content || ''}</textarea>
+  </div>
 </div>
 
 <div class="section">
@@ -1572,7 +1604,12 @@ document.getElementById('btnSaveSetting').onclick=async()=>{
     adminPassword: adminPassword ? adminPassword : undefined,
     turnstile: { siteKey: (document.getElementById('sSite').value||'').trim(), secretKey: (document.getElementById('sSecret').value||'').trim() },
     protectedPrefixes: parseCommaList(document.getElementById('sProtectPrefixes').value),
-    inviteEnabled: document.getElementById('sInvite').checked
+    inviteEnabled: document.getElementById('sInvite').checked,
+    customFooter: {
+      enabled: document.getElementById('sFooterOn').checked,
+      content: document.getElementById('sFooterContent').value
+    },
+    skuDisplayMode: document.getElementById('sSkuDisplayMode').value
   };
   const res=await fetch(adminPath+'/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
   const data=await res.json();
@@ -1678,85 +1715,85 @@ function filterProtectedUsers(list, env, cfg) {
 
 async function handleRegister(env, req, cfg) {
   const form = await req.formData();
-  const username = (form.get('username')||'').trim();
-  const password = form.get('password')||'';
+  const username = (form.get('username') || '').trim();
+  const password = form.get('password') || '';
   const skuName = form.get('skuName');
   const globalId = form.get('globalId');
   const inviteCode = form.get('inviteCode');
   const turnstileToken = form.get('cf-turnstile-response');
   const clientIp = req.headers.get('CF-Connecting-IP');
 
-  const global = (cfg.globals||[]).find(g=>g.id===globalId);
-  if(!global) return jsonResponse({success:false,message:'请选择有效全局'},400);
-  const skuMap = global.skuMap||{};
+  const global = (cfg.globals || []).find(g => g.id === globalId);
+  if (!global) return jsonResponse({ success: false, message: '请选择有效全局' }, 400);
+  const skuMap = global.skuMap || {};
   const skuId = skuMap[skuName];
-  if(!skuId) return jsonResponse({success:false,message:'请选择有效订阅'},400);
-  if(!/^[a-zA-Z0-9]+$/.test(username)) return jsonResponse({success:false,message:'用户名格式错误'},400);
+  if (!skuId) return jsonResponse({ success: false, message: '请选择有效订阅' }, 400);
+  if (!/^[a-zA-Z0-9]+$/.test(username)) return jsonResponse({ success: false, message: '用户名格式错误' }, 400);
 
   // invitation check
-  if(cfg.invite?.enabled){
+  if (cfg.invite?.enabled) {
     const invites = await getInvites(env);
-    const idx = invites.findIndex(c=>c.code===inviteCode);
-    if(idx===-1) return jsonResponse({success:false,message:'邀请码无效'},400);
+    const idx = invites.findIndex(c => c.code === inviteCode);
+    if (idx === -1) return jsonResponse({ success: false, message: '邀请码无效' }, 400);
     const c = invites[idx];
-    if(c.used >= c.limit) return jsonResponse({success:false,message:'邀请码已用完'},400);
-    const allowed = c.allowed||[];
-    const matched = allowed.some(a=>a.globalId===globalId && a.skuName===skuName);
-    if(!matched) return jsonResponse({success:false,message:'邀请码不允许当前全局/订阅'},400);
+    if (c.used >= c.limit) return jsonResponse({ success: false, message: '邀请码已用完' }, 400);
+    const allowed = c.allowed || [];
+    const matched = allowed.some(a => a.globalId === globalId && a.skuName === skuName);
+    if (!matched) return jsonResponse({ success: false, message: '邀请码不允许当前全局/订阅' }, 400);
     c.used += 1; c.usedAt = Date.now();
-    invites[idx]=c; await saveInvites(env,invites);
+    invites[idx] = c; await saveInvites(env, invites);
   }
 
   // turnstile verify
-  if(cfg.turnstile?.secretKey && turnstileToken){
-    const ver = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({secret:cfg.turnstile.secretKey,response:turnstileToken,remoteip:clientIp})
+  if (cfg.turnstile?.secretKey && turnstileToken) {
+    const ver = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ secret: cfg.turnstile.secretKey, response: turnstileToken, remoteip: clientIp })
     });
     const verData = await ver.json();
-    if(!verData.success) return jsonResponse({success:false,message:'人机验证失败'},400);
+    if (!verData.success) return jsonResponse({ success: false, message: '人机验证失败' }, 400);
   }
 
   const userEmail = `${username}@${global.defaultDomain}`;
-  if(isProtectedUpn(userEmail, env, cfg)) {
-    return jsonResponse({success:false,message:'该用户名被禁止注册！请勿尝试注册非法用户名！'},403);
+  if (isProtectedUpn(userEmail, env, cfg)) {
+    return jsonResponse({ success: false, message: '该用户名被禁止注册！请勿尝试注册非法用户名！' }, 403);
   }
 
-  if(password.toLowerCase().includes(username.toLowerCase())) return jsonResponse({success:false,message:'密码不能包含用户名'},400);
-  if(!checkPasswordComplexity(password)) return jsonResponse({success:false,message:'密码不符合复杂度'},400);
+  if (password.toLowerCase().includes(username.toLowerCase())) return jsonResponse({ success: false, message: '密码不能包含用户名' }, 400);
+  if (!checkPasswordComplexity(password)) return jsonResponse({ success: false, message: '密码不符合复杂度' }, 400);
 
   const token = await getAccessTokenForGlobal(global, fetch);
   // create user
-  const createResp = await fetch('https://graph.microsoft.com/v1.0/users',{
-    method:'POST',
-    headers:{'Authorization':`Bearer ${token}`,'Content-Type':'application/json'},
-    body:JSON.stringify({
-      accountEnabled:true,
-      displayName:username,
-      mailNickname:username,
-      userPrincipalName:userEmail,
-      passwordProfile:{forceChangePasswordNextSignIn:false,password},
-      usageLocation:"CN"
+  const createResp = await fetch('https://graph.microsoft.com/v1.0/users', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      accountEnabled: true,
+      displayName: username,
+      mailNickname: username,
+      userPrincipalName: userEmail,
+      passwordProfile: { forceChangePasswordNextSignIn: false, password },
+      usageLocation: "CN"
     })
   });
-  if(!createResp.ok){
-    const err = await createResp.json().catch(()=>({}));
-    return jsonResponse({success:false,message:err.error?.message||'创建失败'},400);
+  if (!createResp.ok) {
+    const err = await createResp.json().catch(() => ({}));
+    return jsonResponse({ success: false, message: err.error?.message || '创建失败' }, 400);
   }
   const newUser = await createResp.json();
 
   // assign license
-  const licResp = await fetch(`https://graph.microsoft.com/v1.0/users/${newUser.id}/assignLicense`,{
-    method:'POST',
-    headers:{'Authorization':`Bearer ${token}`,'Content-Type':'application/json'},
-    body:JSON.stringify({addLicenses:[{disabledPlans:[],skuId}],removeLicenses:[]})
+  const licResp = await fetch(`https://graph.microsoft.com/v1.0/users/${newUser.id}/assignLicense`, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ addLicenses: [{ disabledPlans: [], skuId }], removeLicenses: [] })
   });
-  if(!licResp.ok){
-    const err = await licResp.json().catch(()=>({}));
-    return jsonResponse({success:false,message:'账号已创建但订阅分配失败: '+(err.error?.message||'未知')},400);
+  if (!licResp.ok) {
+    const err = await licResp.json().catch(() => ({}));
+    return jsonResponse({ success: false, message: '账号已创建但订阅分配失败: ' + (err.error?.message || '未知') }, 400);
   }
-  return jsonResponse({success:true,email:userEmail});
+  return jsonResponse({ success: true, email: userEmail });
 }
 
 /* -------------------- Request Handler -------------------- */
@@ -1770,21 +1807,21 @@ export default {
     const isLoginPath = url.pathname === `${adminPath}/login`;
 
     // redirect to setup if not installed
-    if(!installed && !isSetupPath) return redirect(`${adminPath}/setup`);
+    if (!installed && !isSetupPath) return redirect(`${adminPath}/setup`);
 
     /* ---------- Setup ---------- */
-    if(isSetupPath){
-      if(request.method==='GET') return htmlResponse(renderSetup(adminPath));
-      if(request.method==='POST'){
-        const body = await request.json().catch(()=>({}));
+    if (isSetupPath) {
+      if (request.method === 'GET') return htmlResponse(renderSetup(adminPath));
+      if (request.method === 'POST') {
+        const body = await request.json().catch(() => ({}));
         const username = (body.username || '').toString().trim();
         const password = (body.password || '').toString();
 
-        if(!/^[a-zA-Z0-9_\-]{3,32}$/.test(username)){
-          return jsonResponse({success:false,message:'用户名格式不正确（3-32位，仅字母/数字/_/-）'},400);
+        if (!/^[a-zA-Z0-9_\-]{3,32}$/.test(username)) {
+          return jsonResponse({ success: false, message: '用户名格式不正确（3-32位，仅字母/数字/_/-）' }, 400);
         }
-        if(!password || password.length<8){
-          return jsonResponse({success:false,message:'密码至少 8 位'},400);
+        if (!password || password.length < 8) {
+          return jsonResponse({ success: false, message: '密码至少 8 位' }, 400);
         }
 
         const newPath = (body.adminPath || '/admin').toString().trim() || '/admin';
@@ -1792,87 +1829,87 @@ export default {
 
         cfg = mergeConfig({ ...cfg, adminUsername: username, adminPasswordHash: hash, adminPath: newPath });
         await setConfig(env, cfg);
-        await env.CONFIG_KV.put(KV.INSTALL_LOCK,'1');
-        return jsonResponse({success:true});
+        await env.CONFIG_KV.put(KV.INSTALL_LOCK, '1');
+        return jsonResponse({ success: true });
       }
     }
 
     /* ---------- Login ---------- */
-    if(isLoginPath){
-      if(request.method==='GET') return htmlResponse(renderLogin(adminPath));
-      if(request.method==='POST'){
-        const body = await request.json().catch(()=>({}));
+    if (isLoginPath) {
+      if (request.method === 'GET') return htmlResponse(renderLogin(adminPath));
+      if (request.method === 'POST') {
+        const body = await request.json().catch(() => ({}));
         const username = (body.username || '').toString().trim();
-        const pwdHash = await sha256((body.password||'').toString());
+        const pwdHash = await sha256((body.password || '').toString());
 
         const cfgUser = (cfg.adminUsername || 'admin').toString().trim();
-        if(username.toLowerCase() !== cfgUser.toLowerCase() || pwdHash !== cfg.adminPasswordHash){
-          return jsonResponse({success:false,message:'用户名或密码错误'},401);
+        if (username.toLowerCase() !== cfgUser.toLowerCase() || pwdHash !== cfg.adminPasswordHash) {
+          return jsonResponse({ success: false, message: '用户名或密码错误' }, 401);
         }
 
         const token = await createSession(env);
-        return new Response(JSON.stringify({success:true}),{
-          headers:{
-            'Content-Type':'application/json',
-            'Set-Cookie':`ADMIN_SESSION=${token}; Path=/; HttpOnly; Secure; SameSite=Lax`
+        return new Response(JSON.stringify({ success: true }), {
+          headers: {
+            'Content-Type': 'application/json',
+            'Set-Cookie': `ADMIN_SESSION=${token}; Path=/; HttpOnly; Secure; SameSite=Lax`
           }
         });
       }
     }
 
     /* ---------- Admin HTML Pages ---------- */
-    if(url.pathname === `${adminPath}/users`){
-      if(!(await verifySession(env, request))) return redirect(`${adminPath}/login`);
+    if (url.pathname === `${adminPath}/users`) {
+      if (!(await verifySession(env, request))) return redirect(`${adminPath}/login`);
       return htmlResponse(renderUsersPage(adminPath));
     }
-    if(url.pathname === `${adminPath}/globals`){
-      if(!(await verifySession(env, request))) return redirect(`${adminPath}/login`);
+    if (url.pathname === `${adminPath}/globals`) {
+      if (!(await verifySession(env, request))) return redirect(`${adminPath}/login`);
       return htmlResponse(renderGlobalsPage(adminPath));
     }
-    if(url.pathname === `${adminPath}/invites`){
-      if(!(await verifySession(env, request))) return redirect(`${adminPath}/login`);
-      return htmlResponse(renderInvitesPage(adminPath, cfg.globals||[]));
+    if (url.pathname === `${adminPath}/invites`) {
+      if (!(await verifySession(env, request))) return redirect(`${adminPath}/login`);
+      return htmlResponse(renderInvitesPage(adminPath, cfg.globals || []));
     }
-    if(url.pathname === `${adminPath}/settings`){
-      if(!(await verifySession(env, request))) return redirect(`${adminPath}/login`);
+    if (url.pathname === `${adminPath}/settings`) {
+      if (!(await verifySession(env, request))) return redirect(`${adminPath}/login`);
       return htmlResponse(renderSettingsPage(adminPath, cfg));
     }
 
     /* ---------- Admin APIs (auth required) ---------- */
-    if(url.pathname.startsWith(`${adminPath}/api/`)){
-      if(!(await verifySession(env, request))) return jsonResponse({error:'unauthorized'},401);
+    if (url.pathname.startsWith(`${adminPath}/api/`)) {
+      if (!(await verifySession(env, request))) return jsonResponse({ error: 'unauthorized' }, 401);
 
       // fetch SKU list by credentials (without saving global) - admin only
-      if(url.pathname === `${adminPath}/api/fetch_skus` && request.method==='POST'){
-        const body = await request.json().catch(()=>({}));
-        const tenantId = (body.tenantId||'').trim();
-        const clientId = (body.clientId||'').trim();
-        const clientSecret = (body.clientSecret||'').trim();
-        if(!tenantId || !clientId || !clientSecret) return jsonResponse({success:false,message:'缺少租户/客户端信息'},400);
-        try{
+      if (url.pathname === `${adminPath}/api/fetch_skus` && request.method === 'POST') {
+        const body = await request.json().catch(() => ({}));
+        const tenantId = (body.tenantId || '').trim();
+        const clientId = (body.clientId || '').trim();
+        const clientSecret = (body.clientSecret || '').trim();
+        if (!tenantId || !clientId || !clientSecret) return jsonResponse({ success: false, message: '缺少租户/客户端信息' }, 400);
+        try {
           const tmp = { tenantId, clientId, clientSecret };
           const token = await getAccessTokenForGlobal(tmp, fetch);
-          const resp = await fetch('https://graph.microsoft.com/v1.0/subscribedSkus',{headers:{Authorization:`Bearer ${token}`}});
-          if(!resp.ok){
-            const err = await resp.json().catch(()=>({}));
-            return jsonResponse({success:false,message:err?.error?.message||'获取失败'},400);
+          const resp = await fetch('https://graph.microsoft.com/v1.0/subscribedSkus', { headers: { Authorization: `Bearer ${token}` } });
+          if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            return jsonResponse({ success: false, message: err?.error?.message || '获取失败' }, 400);
           }
           const data = await resp.json();
           const map = {};
-          (data.value||[]).forEach(s=>{ map[s.skuPartNumber] = s.skuId; });
-          return jsonResponse({success:true,map});
-        }catch(e){
-          return jsonResponse({success:false,message:e.message||'获取失败'},400);
+          (data.value || []).forEach(s => { map[s.skuPartNumber] = s.skuId; });
+          return jsonResponse({ success: true, map });
+        } catch (e) {
+          return jsonResponse({ success: false, message: e.message || '获取失败' }, 400);
         }
       }
 
       // globals CRUD
-      if(url.pathname === `${adminPath}/api/globals` && request.method==='GET'){
-        const list = (cfg.globals||[]).map(g=>({...g, clientSecret: undefined}));
+      if (url.pathname === `${adminPath}/api/globals` && request.method === 'GET') {
+        const list = (cfg.globals || []).map(g => ({ ...g, clientSecret: undefined }));
         return jsonResponse(list);
       }
-      if(url.pathname === `${adminPath}/api/globals` && request.method==='POST'){
-        const body = await request.json().catch(()=>({}));
+      if (url.pathname === `${adminPath}/api/globals` && request.method === 'POST') {
+        const body = await request.json().catch(() => ({}));
         const id = crypto.randomUUID();
         const item = {
           id,
@@ -1886,19 +1923,19 @@ export default {
         cfg.globals = cfg.globals || [];
         cfg.globals.push(item);
         await setConfig(env, cfg);
-        return jsonResponse({success:true,id});
+        return jsonResponse({ success: true, id });
       }
-      if(url.pathname.match(`${adminPath}/api/globals/[^/]+$`) && request.method==='GET'){
+      if (url.pathname.match(`${adminPath}/api/globals/[^/]+$`) && request.method === 'GET') {
         const gid = url.pathname.split('/').pop();
-        const g = (cfg.globals||[]).find(x=>x.id===gid);
-        if(!g) return jsonResponse({error:'not found'},404);
+        const g = (cfg.globals || []).find(x => x.id === gid);
+        if (!g) return jsonResponse({ error: 'not found' }, 404);
         return jsonResponse(g);
       }
-      if(url.pathname.match(`${adminPath}/api/globals/[^/]+$`) && request.method==='PATCH'){
+      if (url.pathname.match(`${adminPath}/api/globals/[^/]+$`) && request.method === 'PATCH') {
         const gid = url.pathname.split('/').pop();
-        const body = await request.json().catch(()=>({}));
-        const idx = (cfg.globals||[]).findIndex(x=>x.id===gid);
-        if(idx===-1) return jsonResponse({error:'not found'},404);
+        const body = await request.json().catch(() => ({}));
+        const idx = (cfg.globals || []).findIndex(x => x.id === gid);
+        if (idx === -1) return jsonResponse({ error: 'not found' }, 404);
         cfg.globals[idx] = {
           ...cfg.globals[idx],
           label: body.label || cfg.globals[idx].label,
@@ -1909,195 +1946,197 @@ export default {
           skuMap: body.skuMap ? sanitizeSkuMap(body.skuMap) : cfg.globals[idx].skuMap
         };
         await setConfig(env, cfg);
-        return jsonResponse({success:true});
+        return jsonResponse({ success: true });
       }
-      if(url.pathname.match(`${adminPath}/api/globals/[^/]+$`) && request.method==='DELETE'){
+      if (url.pathname.match(`${adminPath}/api/globals/[^/]+$`) && request.method === 'DELETE') {
         const gid = url.pathname.split('/').pop();
-        cfg.globals = (cfg.globals||[]).filter(x=>x.id!==gid);
+        cfg.globals = (cfg.globals || []).filter(x => x.id !== gid);
         await setConfig(env, cfg);
-        return jsonResponse({success:true});
+        return jsonResponse({ success: true });
       }
-      if(url.pathname.match(`${adminPath}/api/globals/[^/]+/skus$`) && request.method==='GET'){
-        const gid = url.pathname.split('/').slice(-2,-1)[0];
-        const g = (cfg.globals||[]).find(x=>x.id===gid);
-        if(!g) return jsonResponse({success:false,message:'未找到全局'},404);
-        try{
+      if (url.pathname.match(`${adminPath}/api/globals/[^/]+/skus$`) && request.method === 'GET') {
+        const gid = url.pathname.split('/').slice(-2, -1)[0];
+        const g = (cfg.globals || []).find(x => x.id === gid);
+        if (!g) return jsonResponse({ success: false, message: '未找到全局' }, 404);
+        try {
           const token = await getAccessTokenForGlobal(g, fetch);
-          const resp = await fetch('https://graph.microsoft.com/v1.0/subscribedSkus',{headers:{Authorization:`Bearer ${token}`}});
+          const resp = await fetch('https://graph.microsoft.com/v1.0/subscribedSkus', { headers: { Authorization: `Bearer ${token}` } });
           const data = await resp.json();
           const map = {};
-          (data.value||[]).forEach(s=>{ map[s.skuPartNumber] = s.skuId; });
-          return jsonResponse({success:true,map});
-        }catch(e){
-          return jsonResponse({success:false,message:e.message},400);
+          (data.value || []).forEach(s => { map[s.skuPartNumber] = s.skuId; });
+          return jsonResponse({ success: true, map });
+        } catch (e) {
+          return jsonResponse({ success: false, message: e.message }, 400);
         }
       }
 
       // settings
-      if(url.pathname === `${adminPath}/api/config` && request.method==='POST'){
-        const body = await request.json().catch(()=>({}));
+      if (url.pathname === `${adminPath}/api/config` && request.method === 'POST') {
+        const body = await request.json().catch(() => ({}));
 
         // admin path
         const newPath = (body.adminPath || adminPath).toString().trim() || adminPath;
 
         // admin credentials
-        if(body.adminUsername !== undefined){
+        if (body.adminUsername !== undefined) {
           const u = (body.adminUsername || '').toString().trim();
-          if(!/^[a-zA-Z0-9_\-]{3,32}$/.test(u)){
-            return jsonResponse({success:false,message:'用户名格式不正确（3-32位，仅字母/数字/_/-）'},400);
+          if (!/^[a-zA-Z0-9_\-]{3,32}$/.test(u)) {
+            return jsonResponse({ success: false, message: '用户名格式不正确（3-32位，仅字母/数字/_/-）' }, 400);
           }
           cfg.adminUsername = u;
         }
-        if(body.adminPassword){
+        if (body.adminPassword) {
           const p = body.adminPassword.toString();
-          if(p.length < 8){
-            return jsonResponse({success:false,message:'密码至少 8 位'},400);
+          if (p.length < 8) {
+            return jsonResponse({ success: false, message: '密码至少 8 位' }, 400);
           }
           cfg.adminPasswordHash = await sha256(p);
         }
 
         // others
         cfg.turnstile = body.turnstile || cfg.turnstile;
-        cfg.protectedUsers = Array.isArray(body.protectedUsers) ? body.protectedUsers : (cfg.protectedUsers||[]);
-        cfg.protectedPrefixes = Array.isArray(body.protectedPrefixes) ? body.protectedPrefixes : (cfg.protectedPrefixes||[]);
-        cfg.invite = { ...(cfg.invite||{}), enabled: !!body.inviteEnabled };
+        cfg.protectedUsers = Array.isArray(body.protectedUsers) ? body.protectedUsers : (cfg.protectedUsers || []);
+        cfg.protectedPrefixes = Array.isArray(body.protectedPrefixes) ? body.protectedPrefixes : (cfg.protectedPrefixes || []);
+        cfg.invite = { ...(cfg.invite || {}), enabled: !!body.inviteEnabled };
+        cfg.customFooter = body.customFooter || cfg.customFooter;
+        if (body.skuDisplayMode) cfg.skuDisplayMode = body.skuDisplayMode;
         cfg.adminPath = newPath;
 
         cfg = mergeConfig(cfg);
         await setConfig(env, cfg);
-        return jsonResponse({success:true,newPath});
+        return jsonResponse({ success: true, newPath });
       }
 
       // users list
-      if(url.pathname === `${adminPath}/api/users` && request.method==='GET'){
+      if (url.pathname === `${adminPath}/api/users` && request.method === 'GET') {
         let result = [];
-        for(const g of (cfg.globals||[])){
-          try{
+        for (const g of (cfg.globals || [])) {
+          try {
             const token = await getAccessTokenForGlobal(g, fetch);
-            const resp = await fetch('https://graph.microsoft.com/v1.0/users?$select=id,displayName,userPrincipalName,createdDateTime,assignedLicenses&$top=100&$orderby=createdDateTime desc&$count=true',{headers:{Authorization:`Bearer ${token}`,'ConsistencyLevel':'eventual'}});
+            const resp = await fetch('https://graph.microsoft.com/v1.0/users?$select=id,displayName,userPrincipalName,createdDateTime,assignedLicenses&$top=100&$orderby=createdDateTime desc&$count=true', { headers: { Authorization: `Bearer ${token}`, 'ConsistencyLevel': 'eventual' } });
             const data = await resp.json();
             let arr = data.value || [];
             arr = filterProtectedUsers(arr, env, cfg);
 
-            const idToName = Object.entries(g.skuMap || {}).reduce((m,[k,v]) => { m[v]=k; return m; }, {});
-            arr.forEach(u=>{
-              u.assignedLicenses = (u.assignedLicenses||[]).map(l=>{
+            const idToName = Object.entries(g.skuMap || {}).reduce((m, [k, v]) => { m[v] = k; return m; }, {});
+            arr.forEach(u => {
+              u.assignedLicenses = (u.assignedLicenses || []).map(l => {
                 const name = idToName[l.skuId] || l.skuId || '';
-                return {...l,name};
+                return { ...l, name };
               });
-              u._licSort = (u.assignedLicenses||[]).map(l=>l.name||'').join(','); // for sorting/search
+              u._licSort = (u.assignedLicenses || []).map(l => l.name || '').join(','); // for sorting/search
               u._globalId = g.id; u._globalLabel = g.label;
             });
             result = result.concat(arr);
-          }catch(e){}
+          } catch (e) { }
         }
         return jsonResponse(result);
       }
 
       // delete user
-      if(url.pathname.match(`${adminPath}/api/users/[^/]+/[^/]+$`) && request.method==='DELETE'){
+      if (url.pathname.match(`${adminPath}/api/users/[^/]+/[^/]+$`) && request.method === 'DELETE') {
         const parts = url.pathname.split('/');
         const userId = parts.pop();
         const gId = parts.pop();
-        const g = (cfg.globals||[]).find(x=>x.id===gId);
-        if(!g) return jsonResponse({error:'not found'},404);
+        const g = (cfg.globals || []).find(x => x.id === gId);
+        if (!g) return jsonResponse({ error: 'not found' }, 404);
         const token = await getAccessTokenForGlobal(g, fetch);
 
         // pre-check protected (fail-closed to avoid mis-delete)
-        const checkResp = await fetch(`https://graph.microsoft.com/v1.0/users/${userId}?$select=userPrincipalName`,{
-          headers:{Authorization:`Bearer ${token}`}
+        const checkResp = await fetch(`https://graph.microsoft.com/v1.0/users/${userId}?$select=userPrincipalName`, {
+          headers: { Authorization: `Bearer ${token}` }
         });
-        if(!checkResp.ok){
-          return jsonResponse({error:'cannot_verify_user'},502);
+        if (!checkResp.ok) {
+          return jsonResponse({ error: 'cannot_verify_user' }, 502);
         }
         const user = await checkResp.json();
         const upn = user.userPrincipalName || '';
-        if(isProtectedUpn(upn, env, cfg)) return jsonResponse({error:'forbidden'},403);
+        if (isProtectedUpn(upn, env, cfg)) return jsonResponse({ error: 'forbidden' }, 403);
 
-        const delResp = await fetch(`https://graph.microsoft.com/v1.0/users/${userId}`,{
-          method:'DELETE',
-          headers:{Authorization:`Bearer ${token}`}
+        const delResp = await fetch(`https://graph.microsoft.com/v1.0/users/${userId}`, {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${token}` }
         });
-        if(!delResp.ok){
-          const t = await delResp.text().catch(()=> '');
-          return jsonResponse({error:'delete_failed', details: t.slice(0,300)}, delResp.status);
+        if (!delResp.ok) {
+          const t = await delResp.text().catch(() => '');
+          return jsonResponse({ error: 'delete_failed', details: t.slice(0, 300) }, delResp.status);
         }
-        return jsonResponse({success:true});
+        return jsonResponse({ success: true });
       }
 
       // reset password
-      if(url.pathname.match(`${adminPath}/api/users/[^/]+/[^/]+/password$`) && request.method==='PATCH'){
+      if (url.pathname.match(`${adminPath}/api/users/[^/]+/[^/]+/password$`) && request.method === 'PATCH') {
         const parts = url.pathname.split('/');
-        const userId = parts[parts.length-2];
-        const gId = parts[parts.length-3];
-        const body = await request.json().catch(()=>({}));
-        const g = (cfg.globals||[]).find(x=>x.id===gId);
-        if(!g) return jsonResponse({error:'not found'},404);
+        const userId = parts[parts.length - 2];
+        const gId = parts[parts.length - 3];
+        const body = await request.json().catch(() => ({}));
+        const g = (cfg.globals || []).find(x => x.id === gId);
+        if (!g) return jsonResponse({ error: 'not found' }, 404);
         const token = await getAccessTokenForGlobal(g, fetch);
-        await fetch(`https://graph.microsoft.com/v1.0/users/${userId}`,{
-          method:'PATCH',
-          headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},
-          body:JSON.stringify({passwordProfile:{forceChangePasswordNextSignIn:false,password:body.password}})
+        await fetch(`https://graph.microsoft.com/v1.0/users/${userId}`, {
+          method: 'PATCH',
+          headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ passwordProfile: { forceChangePasswordNextSignIn: false, password: body.password } })
         });
-        return jsonResponse({success:true});
+        return jsonResponse({ success: true });
       }
 
       // licenses
-      if(url.pathname === `${adminPath}/api/licenses` && request.method==='GET'){
+      if (url.pathname === `${adminPath}/api/licenses` && request.method === 'GET') {
         let list = [];
-        for(const g of (cfg.globals||[])){
-          try{
+        for (const g of (cfg.globals || [])) {
+          try {
             const token = await getAccessTokenForGlobal(g, fetch);
 
             // subscription expiry/renew time (nextLifecycleDateTime)
             let expiryBySkuId = {};
-            try{
-              const subResp = await fetch('https://graph.microsoft.com/v1.0/directory/subscriptions?$select=skuId,skuPartNumber,nextLifecycleDateTime,status',{
-                headers:{Authorization:`Bearer ${token}`}
+            try {
+              const subResp = await fetch('https://graph.microsoft.com/v1.0/directory/subscriptions?$select=skuId,skuPartNumber,nextLifecycleDateTime,status', {
+                headers: { Authorization: `Bearer ${token}` }
               });
-              if(subResp.ok){
-                const subData = await subResp.json().catch(()=>({}));
-                (subData.value||[]).forEach(cs=>{
-                  const skuId = (cs.skuId||'').toString().toLowerCase();
+              if (subResp.ok) {
+                const subData = await subResp.json().catch(() => ({}));
+                (subData.value || []).forEach(cs => {
+                  const skuId = (cs.skuId || '').toString().toLowerCase();
                   const dt = cs.nextLifecycleDateTime;
-                  if(!skuId || !dt) return;
-                  if(!expiryBySkuId[skuId] || new Date(dt) < new Date(expiryBySkuId[skuId])) expiryBySkuId[skuId] = dt;
+                  if (!skuId || !dt) return;
+                  if (!expiryBySkuId[skuId] || new Date(dt) < new Date(expiryBySkuId[skuId])) expiryBySkuId[skuId] = dt;
                 });
               }
-            }catch(e){}
+            } catch (e) { }
 
-            const resp = await fetch('https://graph.microsoft.com/v1.0/subscribedSkus',{headers:{Authorization:`Bearer ${token}`}});
+            const resp = await fetch('https://graph.microsoft.com/v1.0/subscribedSkus', { headers: { Authorization: `Bearer ${token}` } });
             const data = await resp.json();
-            (data.value||[]).forEach(s=>{
-              const skuIdLower = (s.skuId||'').toString().toLowerCase();
+            (data.value || []).forEach(s => {
+              const skuIdLower = (s.skuId || '').toString().toLowerCase();
               list.push({
-                globalId:g.id,
-                globalLabel:g.label,
-                skuPartNumber:s.skuPartNumber,
-                skuId:s.skuId,
-                total:s.prepaidUnits?.enabled||0,
-                used:s.consumedUnits||0,
+                globalId: g.id,
+                globalLabel: g.label,
+                skuPartNumber: s.skuPartNumber,
+                skuId: s.skuId,
+                total: s.prepaidUnits?.enabled || 0,
+                used: s.consumedUnits || 0,
                 expiresAt: expiryBySkuId[skuIdLower] || null
               });
             });
-          }catch(e){}
+          } catch (e) { }
         }
         return jsonResponse(list);
       }
 
       // invites
-      if(url.pathname === `${adminPath}/api/invites` && request.method==='GET'){
+      if (url.pathname === `${adminPath}/api/invites` && request.method === 'GET') {
         await ensureInvites(env);
         let list = await getInvites(env);
         return jsonResponse(list);
       }
-      if(url.pathname === `${adminPath}/api/invites/generate` && request.method==='POST'){
-        const body = await request.json().catch(()=>({}));
-        const sets = body.sets||[];
-        const length = body.length||16;
-        const qty = body.quantity||1;
-        const limit = body.limit||1;
-        const scopes = body.scopes||[];
+      if (url.pathname === `${adminPath}/api/invites/generate` && request.method === 'POST') {
+        const body = await request.json().catch(() => ({}));
+        const sets = body.sets || [];
+        const length = body.length || 16;
+        const qty = body.quantity || 1;
+        const limit = body.limit || 1;
+        const scopes = body.scopes || [];
         const dict = {
           upper: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',
           lower: 'abcdefghijklmnopqrstuvwxyz',
@@ -2105,30 +2144,30 @@ export default {
           sym: '!@#$%^&*()-_=+[]{}<>?'
         };
         let pool = '';
-        sets.forEach(s=>{ if(dict[s]) pool+=dict[s]; });
-        if(!pool) return jsonResponse({success:false,message:'请选择字符集'},400);
-        if(!scopes.length) return jsonResponse({success:false,message:'请选择限制范围'},400);
+        sets.forEach(s => { if (dict[s]) pool += dict[s]; });
+        if (!pool) return jsonResponse({ success: false, message: '请选择字符集' }, 400);
+        if (!scopes.length) return jsonResponse({ success: false, message: '请选择限制范围' }, 400);
         await ensureInvites(env);
         const invites = await getInvites(env);
-        for(let i=0;i<qty;i++){
-          let code=''; for(let j=0;j<length;j++) code+=pool[Math.floor(Math.random()*pool.length)];
-          invites.push({code,limit,used:0,createdAt:Date.now(),usedAt:null,allowed:scopes});
+        for (let i = 0; i < qty; i++) {
+          let code = ''; for (let j = 0; j < length; j++) code += pool[Math.floor(Math.random() * pool.length)];
+          invites.push({ code, limit, used: 0, createdAt: Date.now(), usedAt: null, allowed: scopes });
         }
-        await saveInvites(env,invites);
-        return jsonResponse({success:true,count:qty});
+        await saveInvites(env, invites);
+        return jsonResponse({ success: true, count: qty });
       }
-      if(url.pathname === `${adminPath}/api/invites/bulk` && request.method==='DELETE'){
-        const body = await request.json().catch(()=>({codes:[]}));
-        const codes = body.codes||[];
+      if (url.pathname === `${adminPath}/api/invites/bulk` && request.method === 'DELETE') {
+        const body = await request.json().catch(() => ({ codes: [] }));
+        const codes = body.codes || [];
         const invites = await getInvites(env);
-        const filtered = invites.filter(c=>!codes.includes(c.code));
+        const filtered = invites.filter(c => !codes.includes(c.code));
         await saveInvites(env, filtered);
-        return jsonResponse({success:true,removed: codes.length});
+        return jsonResponse({ success: true, removed: codes.length });
       }
     }
 
     /* ---------- Public register page ---------- */
-    if(request.method === 'GET' && url.pathname === '/'){
+    if (request.method === 'GET' && url.pathname === '/') {
       const globals = (cfg.globals || []).map(g => ({ id: g.id, label: g.label }));
       const selectedGlobalId = url.searchParams.get('g') || globals[0]?.id || '';
       const selectedGlobal = (cfg.globals || []).find(g => g.id === selectedGlobalId) || (cfg.globals || [])[0];
@@ -2144,13 +2183,22 @@ export default {
             const skuId = String(skuMap[name] || '').toLowerCase();
             const sku = bySkuId.get(skuId);
             const rem = sku ? remainingFromSubscribedSku(sku) : 0;
-            return { name, remaining: rem, label: `${name}（剩余总量：${rem}）` };
+            const used = sku ? Number(sku.consumedUnits ?? 0) : 0;
+
+            let labelText = name;
+            if (cfg.skuDisplayMode === 'used') {
+              labelText = `${name}（已注册：${used}）`;
+            } else if (cfg.skuDisplayMode !== 'none') {
+              labelText = `${name}（剩余总量：${rem}）`;
+            }
+
+            return { name, remaining: rem, used: used, label: labelText };
           });
-          skuDisplayList.sort((a,b)=> (b.remaining - a.remaining) || a.name.localeCompare(b.name));
+          skuDisplayList.sort((a, b) => (b.remaining - a.remaining) || a.name.localeCompare(b.name));
         } catch {
-          // fail closed: still render name list without remaining
+          // fail closed: still render name list without counts
           const skuMap = selectedGlobal.skuMap || {};
-          skuDisplayList = Object.keys(skuMap).map(name => ({ name, remaining: 0, label: `${name}（剩余总量：0）` }));
+          skuDisplayList = Object.keys(skuMap).map(name => ({ name, remaining: 0, used: 0, label: name }));
         }
       }
 
@@ -2162,10 +2210,11 @@ export default {
         turnstileSiteKey: cfg.turnstile?.siteKey || '',
         inviteMode: !!cfg.invite?.enabled,
         adminPath,
+        customFooter: cfg.customFooter,
       }));
     }
 
-    if(request.method === 'POST' && url.pathname === '/'){
+    if (request.method === 'POST' && url.pathname === '/') {
       cfg = await getConfig(env); // refresh
       return handleRegister(env, request, cfg);
     }
