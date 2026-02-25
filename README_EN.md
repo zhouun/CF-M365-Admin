@@ -23,8 +23,9 @@ Serverless, fast to deploy, and practical for labs, internal self-service, demos
 
 ### ✅ Frontend (User Side)
 - Self-service Microsoft 365 user registration
-- Subscription options show remaining quantity, e.g. `E1 (Remaining: 200)`
+- **Flexible Subscription Display**: The admin can easily toggle the frontend subscription dropdown to show "Remaining Quantity," "Registered Count," or "Hide Quantity (Show Name Only)", e.g. `E1 (Remaining: 200)` or `E1 (Registered: 5)`.
 - Subscription list automatically sorted by remaining quantity (highest first)
+- **Dynamic Colorful Footer**: Support for customizing the text/links at the bottom of the registration page via the admin panel. Text will automatically match the primary theme color with an elegant breathing gradient animation.
 - **Password policy**: Uppercase / lowercase / numbers / symbols — **3 of 4**, length ≥ 8  
   - Real-time frontend validation; blocked if invalid (saves compute/API calls)
 - **Reserved/protected usernames are forbidden** (local-part level, e.g. `admin`, `root`)  
@@ -41,6 +42,7 @@ Serverless, fast to deploy, and practical for labs, internal self-service, demos
 - License view: total/used/remaining; optionally shows subscription lifecycle/expiration date (if permitted)
 - **Protected usernames**: reserved for security; **cannot be registered or deleted** via UI/API
 - Fully responsive UI; modals and toolbars optimized for mobile
+- **UI Customization Center**: Support formatting the subscription display mode and toggling the dynamic colorful footer on the registration page.
 
 ---
 
@@ -76,8 +78,8 @@ Current version standardizes to **reserved usernames** (local-part, e.g. `admin`
 Legacy versions emphasize SKU mapping and license usage queries.  
 Current version shows remaining quantity on the homepage and sorts the list by availability.
 
-**Security note:**
-- Remaining quantity is rendered server-side without exposing admin querying APIs to the frontend.
+**Security & Display note:**
+- If you don't want to expose the remaining quantity on the frontend, you can now **directly toggle it to "Hide Quantity" or "Registered Count" via the "UI Customization" section in the admin panel**. All rendering is still performed server-side with zero API leakage.
 
 ### 5) Mobile UX (Legacy overflow risk → Current responsive/viewport-safe)
 Current release fixes: overflow tables, oversized modals, huge close buttons, and bulky toolbar layout on mobile.
