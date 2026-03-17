@@ -19,6 +19,8 @@ const DEFAULT_CONFIG = {
   protectedUsers: [], // legacy: full UPN list (deprecated)
   protectedPrefixes: ['admin', 'superadmin', 'root', 'administrator', 'sysadmin', 'owner', 'support', 'helpdesk'],
   invite: { enabled: false, ipLimit: false, ipLimitCount: 1 },
+  directIpLimit: false,
+  directIpLimitCount: 1,
   customFooter: { enabled: false, content: '' },
   skuDisplayMode: 'remaining', // 'remaining' | 'used' | 'none'
 };
@@ -74,6 +76,8 @@ function mergeConfig(raw) {
   cfg.adminPath = (raw.adminPath || base.adminPath || '/admin').toString().trim() || '/admin';
   cfg.adminPasswordHash = (raw.adminPasswordHash || base.adminPasswordHash || '').toString();
   cfg.skuDisplayMode = ['remaining', 'used', 'none'].includes(raw.skuDisplayMode) ? raw.skuDisplayMode : 'remaining';
+  cfg.directIpLimit = !!raw.directIpLimit;
+  cfg.directIpLimitCount = parseInt(raw.directIpLimitCount) || 1;
 
   return cfg;
 }
@@ -1549,9 +1553,13 @@ function renderSettingsPage(adminPath, cfg) {
   <div class="row"><span class="label">后台路径</span><input id="sPath" value="${cfg.adminPath}" placeholder="/admin"></div>
   <div class="row"><span class="label">Turnstile Site Key (留空关闭)</span><input id="sSite" value="${cfg.turnstile.siteKey || ''}"></div>
   <div class="row"><span class="label">Turnstile Secret Key (留空关闭)</span><input id="sSecret" value="${cfg.turnstile.secretKey || ''}"></div>
+  
+  <div class="row"><label class="inline" style="font-weight:bold;margin-top:10px;"><input type="checkbox" id="sDirectIpLimit" ${cfg.directIpLimit ? 'checked' : ''}> 全局限制每个 IP 的最高注册次数（无邀请码时）</label></div>
+  <div class="row" style="margin-top:2px;margin-bottom:10px;"><span class="label">全局单个 IP 最大主注册次数</span><input type="number" id="sDirectIpLimitCount" value="${cfg.directIpLimitCount || 1}" min="1" max="999" style="max-width:120px;"></div>
+
   <div class="row"><label class="inline"><input type="checkbox" id="sInvite" ${cfg.invite?.enabled ? 'checked' : ''}> 启用邀请码注册</label></div>
-  <div class="row" style="margin-top:6px;"><label class="inline" style="color:#6b7280;font-size:13px;"><input type="checkbox" id="sInviteIpLimit" ${cfg.invite?.ipLimit ? 'checked' : ''}> 启用同一网络 IP 次数防刷限制</label></div>
-  <div class="row" style="margin-top:6px;"><span class="label">单个 IP 最大注册次数（防刷策略）</span><input type="number" id="sInviteIpLimitCount" value="${cfg.invite?.ipLimitCount || 1}" min="1" max="999" style="max-width:120px;"></div>
+  <div class="row" style="margin-top:6px;"><label class="inline" style="color:#6b7280;font-size:13px;"><input type="checkbox" id="sInviteIpLimit" ${cfg.invite?.ipLimit ? 'checked' : ''}> 启用同一网络 IP 次数防刷限制（仅对邀请码模式）</label></div>
+  <div class="row" style="margin-top:6px;"><span class="label">单个邀请码下单 IP 最大注册次数</span><input type="number" id="sInviteIpLimitCount" value="${cfg.invite?.ipLimitCount || 1}" min="1" max="999" style="max-width:120px;"></div>
 </div>
 
 <div class="section">
@@ -1606,6 +1614,8 @@ document.getElementById('btnSaveSetting').onclick=async()=>{
     adminPassword: adminPassword ? adminPassword : undefined,
     turnstile: { siteKey: (document.getElementById('sSite').value||'').trim(), secretKey: (document.getElementById('sSecret').value||'').trim() },
     protectedPrefixes: parseCommaList(document.getElementById('sProtectPrefixes').value),
+    directIpLimit: document.getElementById('sDirectIpLimit').checked,
+    directIpLimitCount: parseInt(document.getElementById('sDirectIpLimitCount').value) || 1,
     inviteEnabled: document.getElementById('sInvite').checked,
     inviteIpLimit: document.getElementById('sInviteIpLimit').checked,
     inviteIpLimitCount: parseInt(document.getElementById('sInviteIpLimitCount').value) || 1,
@@ -1734,6 +1744,16 @@ async function handleRegister(env, req, cfg) {
   if (!skuId) return jsonResponse({ success: false, message: '请选择有效订阅' }, 400);
   if (!/^[a-zA-Z0-9]+$/.test(username)) return jsonResponse({ success: false, message: '用户名格式错误' }, 400);
 
+  // Global IP limit verification (if inviteMode is disabled or it's a general protection layer)
+  if (!cfg.invite?.enabled && cfg.directIpLimit && clientIp) {
+    const rawIpRecord = await env.CONFIG_KV.get(`ip_track:${clientIp}`);
+    const ipUsesCount = parseInt(rawIpRecord) || 0;
+    const globalIpLimitCount = cfg.directIpLimitCount || 1;
+    if (ipUsesCount >= globalIpLimitCount) {
+      return jsonResponse({ success: false, message: `您的网络 IP 已达系统最大注册次数限制（${globalIpLimitCount}次），不可再注册` }, 403);
+    }
+  }
+
   // invitation check
   if (cfg.invite?.enabled) {
     const invites = await getInvites(env);
@@ -1812,6 +1832,13 @@ async function handleRegister(env, req, cfg) {
     const err = await licResp.json().catch(() => ({}));
     return jsonResponse({ success: false, message: '账号已创建但订阅分配失败: ' + (err.error?.message || '未知') }, 400);
   }
+
+  // Increment Global IP usage counter
+  if (!cfg.invite?.enabled && cfg.directIpLimit && clientIp) {
+    const existing = await env.CONFIG_KV.get(\`ip_track:\${clientIp}\`);
+    await env.CONFIG_KV.put(\`ip_track:\${clientIp}\`, ((parseInt(existing) || 0) + 1).toString());
+  }
+
   return jsonResponse({ success: true, email: userEmail });
 }
 
@@ -2016,6 +2043,10 @@ export default {
         cfg.turnstile = body.turnstile || cfg.turnstile;
         cfg.protectedUsers = Array.isArray(body.protectedUsers) ? body.protectedUsers : (cfg.protectedUsers || []);
         cfg.protectedPrefixes = Array.isArray(body.protectedPrefixes) ? body.protectedPrefixes : (cfg.protectedPrefixes || []);
+        
+        if (body.directIpLimit !== undefined) cfg.directIpLimit = !!body.directIpLimit;
+        if (body.directIpLimitCount !== undefined) cfg.directIpLimitCount = body.directIpLimitCount;
+
         cfg.invite = { 
           ...(cfg.invite || {}), 
           enabled: !!body.inviteEnabled, 
