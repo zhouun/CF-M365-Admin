@@ -18,7 +18,7 @@ const DEFAULT_CONFIG = {
   // 兼容字段 protectedUsers（旧版按完整邮箱保护）仍保留读取，但不再在 UI 中展示/保存。
   protectedUsers: [], // legacy: full UPN list (deprecated)
   protectedPrefixes: ['admin', 'superadmin', 'root', 'administrator', 'sysadmin', 'owner', 'support', 'helpdesk'],
-  invite: { enabled: false },
+  invite: { enabled: false, ipLimit: false },
   customFooter: { enabled: false, content: '' },
   skuDisplayMode: 'remaining', // 'remaining' | 'used' | 'none'
 };
@@ -1550,6 +1550,7 @@ function renderSettingsPage(adminPath, cfg) {
   <div class="row"><span class="label">Turnstile Site Key (留空关闭)</span><input id="sSite" value="${cfg.turnstile.siteKey || ''}"></div>
   <div class="row"><span class="label">Turnstile Secret Key (留空关闭)</span><input id="sSecret" value="${cfg.turnstile.secretKey || ''}"></div>
   <div class="row"><label class="inline"><input type="checkbox" id="sInvite" ${cfg.invite?.enabled ? 'checked' : ''}> 启用邀请码注册</label></div>
+  <div class="row" style="margin-top:6px;"><label class="inline" style="color:#6b7280;font-size:13px;"><input type="checkbox" id="sInviteIpLimit" ${cfg.invite?.ipLimit ? 'checked' : ''}> 同一邀请码限制每个 IP 仅能注册 1 次（防刷）</label></div>
 </div>
 
 <div class="section">
@@ -1605,6 +1606,7 @@ document.getElementById('btnSaveSetting').onclick=async()=>{
     turnstile: { siteKey: (document.getElementById('sSite').value||'').trim(), secretKey: (document.getElementById('sSecret').value||'').trim() },
     protectedPrefixes: parseCommaList(document.getElementById('sProtectPrefixes').value),
     inviteEnabled: document.getElementById('sInvite').checked,
+    inviteIpLimit: document.getElementById('sInviteIpLimit').checked,
     customFooter: {
       enabled: document.getElementById('sFooterOn').checked,
       content: document.getElementById('sFooterContent').value
@@ -1737,10 +1739,23 @@ async function handleRegister(env, req, cfg) {
     if (idx === -1) return jsonResponse({ success: false, message: '邀请码无效' }, 400);
     const c = invites[idx];
     if (c.used >= c.limit) return jsonResponse({ success: false, message: '邀请码已用完' }, 400);
+    
+    // IP limit verification
+    if (cfg.invite?.ipLimit && clientIp) {
+      if (!c.usedIps) c.usedIps = [];
+      if (c.usedIps.includes(clientIp)) {
+        return jsonResponse({ success: false, message: '您当前的 IP 已经使用过该邀请码，不可重复注册' }, 403);
+      }
+    }
+
     const allowed = c.allowed || [];
     const matched = allowed.some(a => a.globalId === globalId && a.skuName === skuName);
     if (!matched) return jsonResponse({ success: false, message: '邀请码不允许当前全局/订阅' }, 400);
+    
     c.used += 1; c.usedAt = Date.now();
+    if (cfg.invite?.ipLimit && clientIp) {
+      c.usedIps.push(clientIp);
+    }
     invites[idx] = c; await saveInvites(env, invites);
   }
 
@@ -1997,7 +2012,7 @@ export default {
         cfg.turnstile = body.turnstile || cfg.turnstile;
         cfg.protectedUsers = Array.isArray(body.protectedUsers) ? body.protectedUsers : (cfg.protectedUsers || []);
         cfg.protectedPrefixes = Array.isArray(body.protectedPrefixes) ? body.protectedPrefixes : (cfg.protectedPrefixes || []);
-        cfg.invite = { ...(cfg.invite || {}), enabled: !!body.inviteEnabled };
+        cfg.invite = { ...(cfg.invite || {}), enabled: !!body.inviteEnabled, ipLimit: !!body.inviteIpLimit };
         cfg.customFooter = body.customFooter || cfg.customFooter;
         if (body.skuDisplayMode) cfg.skuDisplayMode = body.skuDisplayMode;
         cfg.adminPath = newPath;
