@@ -4,6 +4,13 @@ const KV = {
   SESS_PREFIX: 'sess:',
   INVITES: 'invites', // JSON array
   COMPAT_CARDS: 'cards', // backward compatibility
+  TG_STATE_PREFIX: 'tg_state:', // per-chat conversation state
+  TG_TRACK_PREFIX: 'tg_track:', // per-user registration counter
+  TG_OWNER_PREFIX: 'tg_owner:', // per-user owned accounts list: [{email, globalId}]
+  TG_VERIFY_PREFIX: 'tg_verify:', // per-user pending claim verification code
+  TG_UPDATE_PREFIX: 'tg_update:', // processed Telegram update ids
+  TG_OP_PREFIX: 'tg_op:', // short-lived Telegram operation locks
+  TG_AUTO_INVITE_PREFIX: 'tg_auto_invite:', // per-user auto-granted invite code
 };
 
 const DEFAULT_CONFIG = {
@@ -11,7 +18,7 @@ const DEFAULT_CONFIG = {
   adminUsername: 'admin',
   adminPasswordHash: '',
   turnstile: { siteKey: '', secretKey: '' },
-  globals: [], // [{id,label,tenantId,clientId,clientSecret,defaultDomain,skuMap (object)}]
+  globals: [], // [{id,label,tenantId,clientId,clientSecret,defaultDomain,skuMap (object),senderEmail}]
   // 额外保护账户：仅按用户名（@ 前缀 / local-part）匹配。
   // - 用途：1) 禁止前台注册这些敏感用户名；2) 若这些账号已存在，禁止通过面板/API 删除。
   // - 默认内置常见高危用户名，避免首次部署未设置防护导致全局被盗。
@@ -23,6 +30,22 @@ const DEFAULT_CONFIG = {
   directIpLimitCount: 1,
   customFooter: { enabled: false, content: '' },
   skuDisplayMode: 'remaining', // 'remaining' | 'used' | 'none'
+  inviteCodePrefix: '', // 邀请码前缀，例如 "CF-M365-"
+  // Telegram Bot 对话式注册（对外使用）：
+  // - enabled: 总开关
+  // - botToken: BotFather 颁发的 token
+  // - webhookSecret: 校验 webhook 来源的随机串（后台一键设置时自动生成）
+  // - perUserLimit: 每个 Telegram 用户最多可注册的账号数（防刷，按 TG userId 计数）
+  // - allowSelfPassword: 是否允许用户自行设置密码（否则仅自动生成）
+  // - requireInvite: Bot 注册是否要求邀请码（独立于网页邀请码开关，共用同一邀请码池）
+  // - allowClaim: 是否允许通过邮箱验证码认领网页注册的旧账号（依赖 Mail.Send 权限）
+  // - senderEmail: (已弃用) 发送认领验证码的发件人邮箱 - 现在在每个租户独立配置
+  // - adminTgIds: 管理员 Telegram 用户 ID 列表（可使用 /geninvite 生成邀请码）
+  telegram: {
+    enabled: false, botToken: '', webhookSecret: '', perUserLimit: 1, allowSelfPassword: true,
+    requireInvite: false, allowClaim: false, senderEmail: '', adminTgIds: [], // 向后兼容，优先使用租户级配置
+    forceJoin: false, forceJoinChats: [], autoInviteOnJoin: true, // 强制加入频道/群组 + 自动发放邀请码
+  },
 };
 
 const GITHUB_LINK = 'https://github.com/zixiwangluo/CF-M365-Admin';
@@ -67,6 +90,20 @@ function mergeConfig(raw) {
   cfg.turnstile = { ...base.turnstile, ...(raw.turnstile || {}) };
   cfg.invite = { ...base.invite, ...(raw.invite || {}) };
   cfg.customFooter = { ...base.customFooter, ...(raw.customFooter || {}) };
+  cfg.telegram = { ...base.telegram, ...(raw.telegram || {}) };
+  cfg.inviteCodePrefix = (raw.inviteCodePrefix || '').toString().trim();
+  cfg.telegram.enabled = !!cfg.telegram.enabled;
+  cfg.telegram.botToken = (cfg.telegram.botToken || '').toString().trim();
+  cfg.telegram.webhookSecret = (cfg.telegram.webhookSecret || '').toString().trim();
+  cfg.telegram.perUserLimit = parseInt(cfg.telegram.perUserLimit) || 1;
+  cfg.telegram.allowSelfPassword = cfg.telegram.allowSelfPassword !== false;
+  cfg.telegram.requireInvite = !!cfg.telegram.requireInvite;
+  cfg.telegram.allowClaim = !!cfg.telegram.allowClaim;
+  cfg.telegram.senderEmail = (cfg.telegram.senderEmail || '').toString().trim();
+  cfg.telegram.adminTgIds = Array.isArray(raw.telegram?.adminTgIds) ? raw.telegram.adminTgIds.map(id => String(id).trim()).filter(Boolean) : [];
+  cfg.telegram.forceJoin = !!cfg.telegram.forceJoin;
+  cfg.telegram.forceJoinChats = Array.isArray(raw.telegram?.forceJoinChats) ? raw.telegram.forceJoinChats.map(s => String(s).trim()).filter(Boolean) : [];
+  cfg.telegram.autoInviteOnJoin = cfg.telegram.autoInviteOnJoin !== false;
 
   cfg.globals = Array.isArray(raw.globals) ? raw.globals : base.globals;
   cfg.protectedUsers = Array.isArray(raw.protectedUsers) ? raw.protectedUsers : base.protectedUsers;
@@ -111,6 +148,17 @@ async function getInvites(env) {
 }
 async function saveInvites(env, list) {
   await env.CONFIG_KV.put(KV.INVITES, JSON.stringify(list));
+}
+async function refundInviteUse(env, code, clientIp = null) {
+  const invites = await getInvites(env);
+  const idx = invites.findIndex(x => x.code === code);
+  if (idx === -1) return;
+  invites[idx].used = Math.max(0, (invites[idx].used || 0) - 1);
+  if (clientIp && Array.isArray(invites[idx].usedIps)) {
+    const ipIdx = invites[idx].usedIps.lastIndexOf(clientIp);
+    if (ipIdx !== -1) invites[idx].usedIps.splice(ipIdx, 1);
+  }
+  await saveInvites(env, invites);
 }
 
 async function createSession(env) {
@@ -1135,6 +1183,7 @@ function renderGlobalsPage(adminPath) {
     <div class="row"><span class="label">租户 ID</span><input id="gTenant"></div>
     <div class="row"><span class="label">客户端 ID</span><input id="gClientId"></div>
     <div class="row"><span class="label">客户端密钥</span><input id="gSecret"></div>
+    <div class="row"><span class="label">Telegram 认领验证码发件人邮箱（选填）</span><input id="gSenderEmail" placeholder="例如：noreply@your.onmicrosoft.com"><span style="color:#6b7280;font-size:12px;display:block;margin-top:4px;">用于 /claim 命令发送验证码，需有 Mail.Send 权限</span></div>
     <div class="row"><span class="label">SKU JSON (键为展示名, 值为 SKU ID)</span><textarea id="gSku" rows="4" placeholder='例如 {"E5开发版":"xxx","A1教育":"yyy"}'></textarea>
     <div class="toolbar" style="margin-top:6px;">
       <button id="btnFetchSku" class="btn-ghost" disabled>点我获取SKU</button>
@@ -1209,6 +1258,7 @@ window.editG=async(id)=>{
   document.getElementById('gTenant').value=g.tenantId||'';
   document.getElementById('gClientId').value=g.clientId||'';
   document.getElementById('gSecret').value=g.clientSecret||'';
+  document.getElementById('gSenderEmail').value=g.senderEmail||'';
   document.getElementById('gSku').value=JSON.stringify(g.skuMap||{}, null, 2);
   openModal('modalG');
 };
@@ -1226,6 +1276,7 @@ document.getElementById('btnSaveG').onclick=async()=>{
     tenantId:document.getElementById('gTenant').value.trim(),
     clientId:document.getElementById('gClientId').value.trim(),
     clientSecret:document.getElementById('gSecret').value.trim(),
+    senderEmail:document.getElementById('gSenderEmail').value.trim(),
     skuMap:document.getElementById('gSku').value
   };
   const method = editingId ? 'PATCH' : 'POST';
@@ -1308,8 +1359,8 @@ function renderInvitesPage(adminPath, globals) {
   <div class="toolbar" style="gap:6px;">
     <span class="label" style="margin:0;">排序:</span>
     <select id="sortKey" style="max-width:180px;">
-      <option value="code" selected>邀请码首字母</option>
-      <option value="createdAt">生成时间</option>
+      <option value="code">邀请码首字母</option>
+      <option value="createdAt" selected>生成时间（最新优先）</option>
       <option value="usedAt">使用时间</option>
       <option value="status">使用状态</option>
       <option value="scope">限制范围</option>
@@ -1353,11 +1404,14 @@ function renderInvitesPage(adminPath, globals) {
       <label class="inline"><input type="checkbox" id="cUpper" checked> 大写</label>
       <label class="inline"><input type="checkbox" id="cLower" checked> 小写</label>
       <label class="inline"><input type="checkbox" id="cDigit" checked> 数字</label>
-      <label class="inline"><input type="checkbox" id="cSym" checked> 特殊符号</label>
+      <label class="inline"><input type="checkbox" id="cSym"> 特殊符号</label>
     </div>
-    <div class="row"><span class="label">邀请码长度</span><input id="cLen" type="number" value="16" min="4"></div>
-    <div class="row"><span class="label">生成数量</span><input id="cQty" type="number" value="10" min="1"></div>
+    <div class="row"><span class="label">邀请码长度 (6-32位)</span><input id="cLen" type="number" value="12" min="6" max="32"></div>
+    <div class="row"><span class="label">生成数量 (最多100个)</span><input id="cQty" type="number" value="10" min="1" max="100"></div>
     <div class="row"><span class="label">每个邀请码可使用次数</span><input id="cLimit" type="number" value="1" min="1"></div>
+    <div style="color:#6b7280;font-size:12px;line-height:1.4;margin:8px 0;">
+      提示：为避免混淆，已移除易混淆字符（如 0/O、1/I/l）。生成的邀请码使用加密安全的随机数，并自动去重。
+    </div>
     <div class="row">
       <span class="label">限制可注册的全局+订阅 (至少选一项)</span>
       <div id="scopeWrap" style="max-height:200px;overflow:auto;border:1px solid #e5e7eb;border-radius:12px;padding:10px;background:#fafafa;"></div>
@@ -1376,8 +1430,8 @@ function closeModal(id){ document.getElementById(id).style.display='none'; }
 function openModal(id){ document.getElementById(id).style.display='flex'; }
 
 let invitesCache=[];
-let sortKey='code';
-let sortDir=1; // default asc
+let sortKey='createdAt'; // 默认按创建时间排序
+let sortDir=-1; // 默认倒序（最新的在前）
 let invitePage=1;
 let invitePageSize=20;
 let iSearchField='code';
@@ -1572,10 +1626,51 @@ function renderSettingsPage(adminPath, cfg) {
       <option value="none" ${cfg.skuDisplayMode === 'none' ? 'selected' : ''}>隐藏数量仅显示订阅名</option>
     </select>
   </div>
+  <div class="row" style="margin-top:8px;">
+    <span class="label">邀请码前缀（选填）</span>
+    <input id="sInvitePrefix" value="${cfg.inviteCodePrefix || ''}" placeholder="例如：CF-M365-" style="max-width:200px;">
+    <span style="color:#6b7280;font-size:12px;margin-left:8px;">生成邀请码时自动添加前缀，例如：CF-M365-Hk7m9XpN</span>
+  </div>
   <div class="row" style="margin-top:8px;"><label class="inline"><input type="checkbox" id="sFooterOn" ${cfg.customFooter?.enabled ? 'checked' : ''}> 启用注册页底部自定义内容</label></div>
   <div class="row" style="margin-top:8px;">
     <span class="label">自定义内容 (支持普通文本与 HTML 标签，如 &lt;a&gt;)</span>
     <textarea id="sFooterContent" rows="3" placeholder="例如：&lt;a href='https://example.com' target='_blank' style='color:var(--primary);font-weight:600;text-decoration:none;'&gt;联系我们&lt;/a&gt;">${cfg.customFooter?.content || ''}</textarea>
+  </div>
+</div>
+
+<div class="section">
+  <h3 style="margin-top:0;">Telegram Bot 注册</h3>
+  <div class="row"><label class="inline" style="font-weight:bold;"><input type="checkbox" id="sTgEnabled" ${cfg.telegram?.enabled ? 'checked' : ''}> 启用 Telegram Bot 对话式注册</label></div>
+  <div class="row" style="margin-top:8px;"><span class="label">Bot Token（BotFather 颁发）</span><input id="sTgToken" value="${cfg.telegram?.botToken || ''}" placeholder="123456:ABC-DEF..."></div>
+  <div class="row" style="margin-top:8px;"><span class="label">每个 Telegram 用户最大注册次数</span><input type="number" id="sTgPerUser" value="${cfg.telegram?.perUserLimit || 1}" min="1" max="999" style="max-width:120px;"></div>
+  <div class="row" style="margin-top:8px;"><label class="inline"><input type="checkbox" id="sTgSelfPwd" ${cfg.telegram?.allowSelfPassword !== false ? 'checked' : ''}> 允许用户自行设置密码（关闭则仅自动生成）</label></div>
+  <div class="row" style="margin-top:8px;"><label class="inline"><input type="checkbox" id="sTgRequireInvite" ${cfg.telegram?.requireInvite ? 'checked' : ''}> Bot 注册要求邀请码（与网页共用同一邀请码池）</label></div>
+  <div class="row" style="margin-top:8px;"><label class="inline"><input type="checkbox" id="sTgAllowClaim" ${cfg.telegram?.allowClaim ? 'checked' : ''}> 允许用户认领网页注册的旧账号（需 Mail.Send 权限）</label></div>
+  <div class="row" style="margin-top:8px;"><label class="inline" style="font-weight:bold;"><input type="checkbox" id="sTgForceJoin" ${cfg.telegram?.forceJoin ? 'checked' : ''}> 强制用户加入指定频道/群组才能使用 Bot</label></div>
+  <div class="row" style="margin-top:8px;">
+    <span class="label">要求加入的频道/群组（每行一个，支持 @username / t.me 链接 / 数字 chat ID / 邀请链接|chatId）</span>
+    <textarea id="sTgForceJoinChats" rows="3" placeholder="例如：&#10;@mychannel&#10;https://t.me/mygroup&#10;-1001234567890">${(cfg.telegram?.forceJoinChats || []).join('\n')}</textarea>
+    <span style="color:#6b7280;font-size:12px;display:block;margin-top:4px;">Bot 需为目标频道/群组的管理员（用于 getChatMember 验证成员身份）。支持格式：@username、https://t.me/username、数字 chat ID、私聊邀请链接|chatId。</span>
+  </div>
+  <div class="row" style="margin-top:8px;"><label class="inline"><input type="checkbox" id="sTgAutoInvite" ${cfg.telegram?.autoInviteOnJoin !== false ? 'checked' : ''}> 用户加入后自动发放一个专属邀请码（每人一次，可用 1 次，适用全部订阅）</label></div>
+  <div class="row" style="margin-top:8px;">
+    <span class="label">管理员 Telegram ID（英文逗号分隔，可使用 /geninvite 生成邀请码）</span>
+    <input id="sTgAdminIds" value="${(cfg.telegram?.adminTgIds || []).join(', ')}" placeholder="例如：123456789, 987654321">
+    <span style="color:#6b7280;font-size:12px;display:block;margin-top:4px;">如何获取你的 Telegram ID：发送 /start 给 @userinfobot</span>
+  </div>
+  <div style="color:#6b7280;font-size:12px;line-height:1.6;margin-top:8px;">
+    说明：<br/>
+    1) 填写 Bot Token 后点 <strong>💾 保存</strong>，再点 <strong>连接 Webhook</strong> 即可让 Bot 上线（自动绑定到本 Worker 域名）。<br/>
+    2) Webhook 使用随机密钥校验来源，仅接受 Telegram 的请求。<br/>
+    3) 用户在 Telegram 里发送 <code>/register</code> 注册、<code>/myaccounts</code> 管理账号（改密/删除）、<code>/claim</code> 认领旧账号、<code>/cancel</code> 取消。<br/>
+    4) 管理员可使用 <code>/geninvite</code> 在 Telegram 中生成邀请码（需配置管理员 ID）。<br/>
+   5) 认领功能需给 Azure 应用授予 <strong>Mail.Send</strong> 应用权限并管理员同意，并在<strong>全局管理</strong>中为每个租户配置发件人邮箱（多租户场景下每个租户可使用不同的发件人）。<br/>
+   6) 强制加入：开启后非管理员用户必须加入所有指定频道/群组才能使用 Bot；加入后可自动获得一个专属邀请码（需配合 Bot 注册要求邀请码 使用）。<br/>
+   7) Webhook 当前状态：<strong>${cfg.telegram?.webhookSecret ? '已连接 ✅' : '未连接 ⚪'}</strong>
+  </div>
+  <div class="toolbar" style="margin-top:12px;">
+    <button id="btnTgSetWebhook" type="button">🔗 连接 Webhook</button>
+    <button id="btnTgDelWebhook" type="button" style="background:#6b7280;">✂️ 断开 Webhook</button>
   </div>
 </div>
 
@@ -1623,7 +1718,20 @@ document.getElementById('btnSaveSetting').onclick=async()=>{
       enabled: document.getElementById('sFooterOn').checked,
       content: document.getElementById('sFooterContent').value
     },
-    skuDisplayMode: document.getElementById('sSkuDisplayMode').value
+    skuDisplayMode: document.getElementById('sSkuDisplayMode').value,
+    inviteCodePrefix: document.getElementById('sInvitePrefix').value.trim(),
+    telegram: {
+      enabled: document.getElementById('sTgEnabled').checked,
+      botToken: (document.getElementById('sTgToken').value||'').trim(),
+      perUserLimit: parseInt(document.getElementById('sTgPerUser').value) || 1,
+      allowSelfPassword: document.getElementById('sTgSelfPwd').checked,
+      requireInvite: document.getElementById('sTgRequireInvite').checked,
+      allowClaim: document.getElementById('sTgAllowClaim').checked,
+      adminTgIds: (document.getElementById('sTgAdminIds').value||'').split(',').map(s=>s.trim()).filter(Boolean),
+      forceJoin: document.getElementById('sTgForceJoin').checked,
+      forceJoinChats: (document.getElementById('sTgForceJoinChats').value||'').split(/\r?\n/).map(s=>s.trim()).filter(Boolean),
+      autoInviteOnJoin: document.getElementById('sTgAutoInvite').checked
+    }
   };
   const res=await fetch(adminPath+'/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
   const data=await res.json();
@@ -1631,6 +1739,23 @@ document.getElementById('btnSaveSetting').onclick=async()=>{
     alert('保存成功');
     if(data.newPath && data.newPath !== adminPath){ location.href = data.newPath + '/settings'; }
   } else alert(data.message||'保存失败');
+};
+
+const btnTgSet=document.getElementById('btnTgSetWebhook');
+if(btnTgSet) btnTgSet.onclick=async()=>{
+  if(!confirm('将使用当前保存的 Bot Token 连接 Webhook。请确保已先点击“保存”。是否继续？')) return;
+  const res=await fetch(adminPath+'/api/tg/setwebhook',{method:'POST'});
+  const data=await res.json();
+  if(data.success){ alert('Webhook 已连接：\\n'+data.webhookUrl); location.reload(); }
+  else alert(data.message||'连接失败');
+};
+const btnTgDel=document.getElementById('btnTgDelWebhook');
+if(btnTgDel) btnTgDel.onclick=async()=>{
+  if(!confirm('断开后 Bot 将停止接收消息，确定继续？')) return;
+  const res=await fetch(adminPath+'/api/tg/deletewebhook',{method:'POST'});
+  const data=await res.json();
+  if(data.success){ alert('已断开 Webhook'); location.reload(); }
+  else alert(data.message||'断开失败');
 };
 </script>
     `,
@@ -1727,6 +1852,95 @@ function filterProtectedUsers(list, env, cfg) {
   });
 }
 
+// Generate a password that always satisfies checkPasswordComplexity (4-select-3, length>=8).
+function generatePassword(len = 14) {
+  const upper = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+  const lower = 'abcdefghijkmnpqrstuvwxyz';
+  const digit = '23456789';
+  const symbol = '!@#$%^&*-_=+';
+  const all = upper + lower + digit + symbol;
+  const rand = (set) => set[crypto.getRandomValues(new Uint32Array(1))[0] % set.length];
+  // guarantee one of each category (covers 4-of-4, well above the 3 required)
+  const chars = [rand(upper), rand(lower), rand(digit), rand(symbol)];
+  while (chars.length < Math.max(8, len)) chars.push(rand(all));
+  // Fisher-Yates shuffle so the guaranteed chars aren't always at the front
+  for (let i = chars.length - 1; i > 0; i--) {
+    const j = crypto.getRandomValues(new Uint32Array(1))[0] % (i + 1);
+    [chars[i], chars[j]] = [chars[j], chars[i]];
+  }
+  return chars.join('');
+}
+
+async function rollbackM365User(token, userId) {
+  if (!userId) return { ok: false, message: 'missing user id' };
+  try {
+    const resp = await fetch(`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(userId)}`, {
+      method: 'DELETE',
+      headers: { 'Authorization': `Bearer ${token}` }
+    });
+    if (resp.ok || resp.status === 404) return { ok: true };
+    const body = await resp.text().catch(() => '');
+    return { ok: false, message: body.slice(0, 200) || `HTTP ${resp.status}` };
+  } catch (e) {
+    return { ok: false, message: e?.message || 'unknown error' };
+  }
+}
+
+// Core M365 user creation, shared by web form and Telegram bot.
+// Performs: protected-username check, password validation, Graph create + license assign.
+// Returns { success, email } or { success:false, message, status }.
+async function createM365User(env, cfg, { global, username, password, skuId }) {
+  const userEmail = `${username}@${global.defaultDomain}`;
+  if (isProtectedUpn(userEmail, env, cfg)) {
+    return { success: false, message: '该用户名被禁止注册！请勿尝试注册非法用户名！', status: 403 };
+  }
+
+  if (password.toLowerCase().includes(username.toLowerCase())) return { success: false, message: '密码不能包含用户名', status: 400 };
+  if (!checkPasswordComplexity(password)) return { success: false, message: '密码不符合复杂度', status: 400 };
+
+  const token = await getAccessTokenForGlobal(global, fetch);
+  // create user
+  const createResp = await fetch('https://graph.microsoft.com/v1.0/users', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      accountEnabled: true,
+      displayName: username,
+      mailNickname: username,
+      userPrincipalName: userEmail,
+      passwordProfile: { forceChangePasswordNextSignIn: false, password },
+      usageLocation: "CN"
+    })
+  });
+  if (!createResp.ok) {
+    const err = await createResp.json().catch(() => ({}));
+    return { success: false, message: err.error?.message || '创建失败', status: 400 };
+  }
+  const newUser = await createResp.json();
+
+  // assign license
+  let licResp;
+  try {
+    licResp = await fetch(`https://graph.microsoft.com/v1.0/users/${newUser.id}/assignLicense`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ addLicenses: [{ disabledPlans: [], skuId }], removeLicenses: [] })
+    });
+  } catch (e) {
+    const rollback = await rollbackM365User(token, newUser.id);
+    const cleanup = rollback.ok ? '已自动删除刚创建的账号。' : `自动回滚删除失败：${rollback.message}`;
+    return { success: false, message: `订阅分配请求失败：${e?.message || '未知错误'}；${cleanup}`, status: rollback.ok ? 400 : 500, accountMayExist: !rollback.ok };
+  }
+  if (!licResp.ok) {
+    const err = await licResp.json().catch(() => ({}));
+    const rollback = await rollbackM365User(token, newUser.id);
+    const cleanup = rollback.ok ? '已自动删除刚创建的账号。' : `自动回滚删除失败：${rollback.message}`;
+    return { success: false, message: `订阅分配失败：${err.error?.message || '未知错误'}；${cleanup}`, status: rollback.ok ? 400 : 500, accountMayExist: !rollback.ok };
+  }
+
+  return { success: true, email: userEmail };
+}
+
 async function handleRegister(env, req, cfg) {
   const form = await req.formData();
   const username = (form.get('username') || '').trim();
@@ -1754,6 +1968,9 @@ async function handleRegister(env, req, cfg) {
     }
   }
 
+  let webInviteConsumed = false;
+  let webInviteIpConsumed = false;
+
   // invitation check
   if (cfg.invite?.enabled) {
     const invites = await getInvites(env);
@@ -1761,7 +1978,7 @@ async function handleRegister(env, req, cfg) {
     if (idx === -1) return jsonResponse({ success: false, message: '邀请码无效' }, 400);
     const c = invites[idx];
     if (c.used >= c.limit) return jsonResponse({ success: false, message: '邀请码已用完' }, 400);
-    
+
     // IP limit verification
     if (cfg.invite?.ipLimit && clientIp) {
       if (!c.usedIps) c.usedIps = [];
@@ -1773,12 +1990,14 @@ async function handleRegister(env, req, cfg) {
     }
 
     const allowed = c.allowed || [];
-    const matched = allowed.some(a => a.globalId === globalId && a.skuName === skuName);
+    const matched = !allowed.length || allowed.some(a => a.globalId === globalId && a.skuName === skuName);
     if (!matched) return jsonResponse({ success: false, message: '邀请码不允许当前全局/订阅' }, 400);
-    
+
     c.used += 1; c.usedAt = Date.now();
+    webInviteConsumed = true;
     if (cfg.invite?.ipLimit && clientIp) {
       c.usedIps.push(clientIp);
+      webInviteIpConsumed = true;
     }
     invites[idx] = c; await saveInvites(env, invites);
   }
@@ -1791,60 +2010,1284 @@ async function handleRegister(env, req, cfg) {
       body: JSON.stringify({ secret: cfg.turnstile.secretKey, response: turnstileToken, remoteip: clientIp })
     });
     const verData = await ver.json();
-    if (!verData.success) return jsonResponse({ success: false, message: '人机验证失败' }, 400);
+    if (!verData.success) {
+      if (webInviteConsumed) await refundInviteUse(env, inviteCode, webInviteIpConsumed ? clientIp : null);
+      return jsonResponse({ success: false, message: '人机验证失败' }, 400);
+    }
   }
 
-  const userEmail = `${username}@${global.defaultDomain}`;
-  if (isProtectedUpn(userEmail, env, cfg)) {
-    return jsonResponse({ success: false, message: '该用户名被禁止注册！请勿尝试注册非法用户名！' }, 403);
-  }
-
-  if (password.toLowerCase().includes(username.toLowerCase())) return jsonResponse({ success: false, message: '密码不能包含用户名' }, 400);
-  if (!checkPasswordComplexity(password)) return jsonResponse({ success: false, message: '密码不符合复杂度' }, 400);
-
-  const token = await getAccessTokenForGlobal(global, fetch);
-  // create user
-  const createResp = await fetch('https://graph.microsoft.com/v1.0/users', {
-    method: 'POST',
-    headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      accountEnabled: true,
-      displayName: username,
-      mailNickname: username,
-      userPrincipalName: userEmail,
-      passwordProfile: { forceChangePasswordNextSignIn: false, password },
-      usageLocation: "CN"
-    })
-  });
-  if (!createResp.ok) {
-    const err = await createResp.json().catch(() => ({}));
-    return jsonResponse({ success: false, message: err.error?.message || '创建失败' }, 400);
-  }
-  const newUser = await createResp.json();
-
-  // assign license
-  const licResp = await fetch(`https://graph.microsoft.com/v1.0/users/${newUser.id}/assignLicense`, {
-    method: 'POST',
-    headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ addLicenses: [{ disabledPlans: [], skuId }], removeLicenses: [] })
-  });
-  if (!licResp.ok) {
-    const err = await licResp.json().catch(() => ({}));
-    return jsonResponse({ success: false, message: '账号已创建但订阅分配失败: ' + (err.error?.message || '未知') }, 400);
+  const result = await createM365User(env, cfg, { global, username, password, skuId });
+  if (!result.success) {
+    if (webInviteConsumed && !result.accountMayExist) await refundInviteUse(env, inviteCode, webInviteIpConsumed ? clientIp : null);
+    return jsonResponse({ success: false, message: result.message }, result.status || 400);
   }
 
   // Increment Global IP usage counter
   if (!cfg.invite?.enabled && cfg.directIpLimit && clientIp) {
-    const existing = await env.CONFIG_KV.get(\`ip_track:\${clientIp}\`);
-    await env.CONFIG_KV.put(\`ip_track:\${clientIp}\`, ((parseInt(existing) || 0) + 1).toString());
+    const existing = await env.CONFIG_KV.get(`ip_track:${clientIp}`);
+    await env.CONFIG_KV.put(`ip_track:${clientIp}`, ((parseInt(existing) || 0) + 1).toString());
   }
 
-  return jsonResponse({ success: true, email: userEmail });
+  return jsonResponse({ success: true, email: result.email });
+}
+
+/* -------------------- Telegram Bot -------------------- */
+// Escape text for Telegram HTML parse_mode.
+function tgHtmlEsc(s) {
+  return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// Call the Telegram Bot API. Returns parsed JSON (or {} on failure).
+async function tgApi(token, method, payload) {
+  try {
+    const resp = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    return await resp.json().catch(() => ({}));
+  } catch {
+    return {};
+  }
+}
+
+// Per-chat conversation state (KV, short TTL so stale flows auto-expire).
+async function getTgState(env, chatId) {
+  const raw = await env.CONFIG_KV.get(KV.TG_STATE_PREFIX + chatId, 'json');
+  return raw || { step: 'idle' };
+}
+async function setTgState(env, chatId, state, userId) {
+  const ownerId = userId != null ? String(userId) : (state?.userId != null ? String(state.userId) : null);
+  const next = ownerId ? { ...state, userId: ownerId } : state;
+  await env.CONFIG_KV.put(KV.TG_STATE_PREFIX + chatId, JSON.stringify(next), { expirationTtl: 900 });
+}
+async function clearTgState(env, chatId) {
+  await env.CONFIG_KV.delete(KV.TG_STATE_PREFIX + chatId);
+}
+function tgStateBelongsTo(state, userId) {
+  if (!state?.userId) return true;
+  return userId != null && String(state.userId) === String(userId);
+}
+async function rejectTgStateOwnerMismatch(env, cfg, chatId) {
+  await clearTgState(env, chatId);
+  await tgApi(cfg.telegram.botToken, 'sendMessage', {
+    chat_id: chatId,
+    text: '当前会话已失效，请重新发送 /start 后继续。',
+  });
+}
+async function acquireTgOpLock(env, key, ttl = 120) {
+  const fullKey = KV.TG_OP_PREFIX + key;
+  const existing = await env.CONFIG_KV.get(fullKey);
+  if (existing) return null;
+  await env.CONFIG_KV.put(fullKey, Date.now().toString(), { expirationTtl: ttl });
+  return fullKey;
+}
+async function releaseTgOpLock(env, fullKey) {
+  if (fullKey) await env.CONFIG_KV.delete(fullKey);
+}
+
+// -------- Ownership binding (which M365 accounts a TG user owns) --------
+// Stored as [{ email, globalId }] under tg_owner:<userId>. No TTL (persistent).
+async function getTgOwned(env, userId) {
+  if (!userId) return [];
+  const raw = await env.CONFIG_KV.get(KV.TG_OWNER_PREFIX + userId, 'json');
+  return Array.isArray(raw) ? raw : [];
+}
+async function addTgOwned(env, userId, email, globalId) {
+  if (!userId) return;
+  const list = await getTgOwned(env, userId);
+  const em = (email || '').toLowerCase();
+  if (list.some(x => (x.email || '').toLowerCase() === em && x.globalId === globalId)) return;
+  list.push({ email, globalId });
+  await env.CONFIG_KV.put(KV.TG_OWNER_PREFIX + userId, JSON.stringify(list));
+}
+async function removeTgOwned(env, userId, email, globalId) {
+  if (!userId) return;
+  const em = (email || '').toLowerCase();
+  const list = (await getTgOwned(env, userId)).filter(
+    x => !((x.email || '').toLowerCase() === em && x.globalId === globalId)
+  );
+  await env.CONFIG_KV.put(KV.TG_OWNER_PREFIX + userId, JSON.stringify(list));
+}
+
+// -------- Graph helpers for account management --------
+// Look up a user by UPN in a specific global. Returns { id, userPrincipalName } or null.
+async function graphFindUser(global, email) {
+  try {
+    const token = await getAccessTokenForGlobal(global, fetch);
+    const resp = await fetch(
+      `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(email)}?$select=id,userPrincipalName`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (!resp.ok) return null;
+    return await resp.json();
+  } catch { return null; }
+}
+
+// Reset a user's password. Returns { success, message }.
+async function graphResetPassword(global, email, newPassword) {
+  const user = await graphFindUser(global, email);
+  if (!user?.id) return { success: false, message: '账号不存在或无法访问' };
+  try {
+    const token = await getAccessTokenForGlobal(global, fetch);
+    const resp = await fetch(`https://graph.microsoft.com/v1.0/users/${user.id}`, {
+      method: 'PATCH',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ passwordProfile: { forceChangePasswordNextSignIn: false, password: newPassword } }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      return { success: false, message: err.error?.message || '改密失败' };
+    }
+    return { success: true };
+  } catch (e) { return { success: false, message: e.message }; }
+}
+
+// Delete a user (with protected pre-check). Returns { success, message }.
+async function graphDeleteUser(env, cfg, global, email) {
+  if (isProtectedUpn(email, env, cfg)) return { success: false, message: '该账号受保护，禁止删除' };
+  const user = await graphFindUser(global, email);
+  if (!user?.id) return { success: false, message: '账号不存在或无法访问' };
+  try {
+    const token = await getAccessTokenForGlobal(global, fetch);
+    const resp = await fetch(`https://graph.microsoft.com/v1.0/users/${user.id}`, {
+      method: 'DELETE', headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!resp.ok) {
+      const t = await resp.text().catch(() => '');
+      return { success: false, message: '删除失败：' + t.slice(0, 200) };
+    }
+    return { success: true };
+  } catch (e) { return { success: false, message: e.message }; }
+}
+
+// Send a claim verification code to the account's own M365 mailbox via Graph sendMail.
+// Requires Mail.Send application permission and a configured sender mailbox.
+async function graphSendClaimCode(cfg, global, toEmail, code) {
+  // 优先使用租户级配置的发件人邮箱，向后兼容全局配置
+  const sender = (global.senderEmail || cfg.telegram?.senderEmail || '').trim();
+  if (!sender) return { success: false, message: '未配置发件人邮箱，无法发送验证码' };
+  try {
+    const token = await getAccessTokenForGlobal(global, fetch);
+    const resp = await fetch(
+      `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(sender)}/sendMail`,
+      {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: {
+            subject: 'Telegram 账号认领验证码',
+            body: { contentType: 'Text', content: `你的验证码是：${code}\n\n10 分钟内有效。如非本人操作请忽略。` },
+            toRecipients: [{ emailAddress: { address: toEmail } }],
+          },
+          saveToSentItems: false,
+        }),
+      }
+    );
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      return { success: false, message: err.error?.message || '邮件发送失败' };
+    }
+    return { success: true };
+  } catch (e) { return { success: false, message: e.message }; }
+}
+
+// Validate an invite code against a chosen global+sku. Returns { ok, message }.
+async function validateBotInvite(env, code, globalId, skuName) {
+  const invites = await getInvites(env);
+  const c = invites.find(x => x.code === code);
+  if (!c) return { ok: false, message: '邀请码无效' };
+  if (c.used >= c.limit) return { ok: false, message: '邀请码已用完' };
+  const allowed = c.allowed || [];
+  const matched = !allowed.length || allowed.some(a => a.globalId === globalId && a.skuName === skuName);
+  if (!matched) return { ok: false, message: '邀请码不允许当前订阅' };
+  return { ok: true };
+}
+// Consume one use of an invite code (called just before account creation).
+async function consumeBotInvite(env, code) {
+  const invites = await getInvites(env);
+  const idx = invites.findIndex(x => x.code === code);
+  if (idx === -1) return;
+  invites[idx].used = (invites[idx].used || 0) + 1;
+  invites[idx].usedAt = Date.now();
+  await saveInvites(env, invites);
+}
+// Refund one use of an invite code (called when account creation fails after consuming).
+async function refundBotInvite(env, code) {
+  await refundInviteUse(env, code);
+}
+
+// ---- Force-join & auto-invite helpers ----
+
+// Parse a force-join chat entry string into { id, url }.
+// Supported: @username, https://t.me/username, inviteLink|chatId, -100xxx.
+function parseTgChatEntry(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return null;
+  if (s.includes('|')) {
+    const [link, cid] = s.split('|').map(x => (x || '').trim());
+    return { id: cid || null, url: link || null };
+  }
+  if (s.startsWith('@')) return { id: s, url: `https://t.me/${s.slice(1)}` };
+  if (/^https?:\/\/t\.me\//i.test(s)) {
+    const m = s.match(/t\.me\/([a-zA-Z0-9_]+)/i);
+    return { id: m ? `@${m[1]}` : null, url: s };
+  }
+  if (/^-?\d+$/.test(s)) return { id: s, url: null };
+  return { id: `@${s}`, url: `https://t.me/${s}` };
+}
+
+// Check whether a Telegram user is a member of all required chats.
+// Returns { joined: boolean, missing: [{ id, url, title }] }.
+async function checkTgMembership(token, userId, chats) {
+  const missing = [];
+  for (const entry of chats) {
+    const parsed = parseTgChatEntry(entry);
+    if (!parsed) continue;
+    if (!parsed.id) { missing.push({ ...parsed, title: '频道/群组' }); continue; }
+    const res = await tgApi(token, 'getChatMember', { chat_id: parsed.id, user_id: userId });
+    const status = res?.result?.status;
+    if (status === 'member' || status === 'administrator' || status === 'creator') continue;
+    let title = parsed.id;
+    const chatRes = await tgApi(token, 'getChat', { chat_id: parsed.id });
+    if (chatRes?.ok && chatRes?.result?.title) title = chatRes.result.title;
+    missing.push({ ...parsed, title });
+  }
+  return { joined: missing.length === 0, missing };
+}
+
+// Show (or edit) the force-join gate: list chats to join + re-check button.
+async function showTgJoinGate(env, cfg, chatId, missing, msgId) {
+  const token = cfg.telegram.botToken;
+  await clearTgState(env, chatId);
+  const lines = ['🔒 请先加入以下频道和群组后使用本 Bot：', ''];
+  const buttons = [];
+  for (const m of missing) {
+    const label = m.title || '频道/群组';
+    lines.push(`• ${tgHtmlEsc(label)}`);
+    if (m.url) buttons.push([{ text: `📢 加入 ${label}`, url: m.url }]);
+  }
+  lines.push('', '加入后点击下方按钮重新验证：');
+  buttons.push([{ text: '✅ 我已加入', callback_data: 'join:check' }]);
+  await tgSendOrEdit(token, chatId, msgId, {
+    text: lines.join('\n'),
+    reply_markup: { inline_keyboard: buttons },
+  });
+}
+
+// Generate a personal 1-use invite code for auto-grant. allowed=[] means all scopes.
+async function grantAutoInvite(env, cfg, userId) {
+  const prefix = (cfg.inviteCodePrefix || '').trim();
+  const length = 12;
+  const dict = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789';
+  await ensureInvites(env);
+  const invites = await getInvites(env);
+  const existingCodes = new Set(invites.map(x => x.code));
+  let code = '';
+  for (let attempt = 0; attempt < 50; attempt++) {
+    let candidate = prefix;
+    const randomBytes = new Uint8Array(length);
+    crypto.getRandomValues(randomBytes);
+    for (let j = 0; j < length; j++) candidate += dict[randomBytes[j] % dict.length];
+    if (!existingCodes.has(candidate)) { code = candidate; break; }
+  }
+  if (!code) return null;
+  invites.push({ code, limit: 1, used: 0, createdAt: Date.now(), usedAt: null, allowed: [], autoFor: String(userId) });
+  await saveInvites(env, invites);
+  return code;
+}
+
+// Auto-grant a personal invite code to a user (once per user). Returns true if a new code was granted.
+async function tgAutoGrantInvite(env, cfg, chatId, userId) {
+  const token = cfg.telegram.botToken;
+  const autoKey = KV.TG_AUTO_INVITE_PREFIX + userId;
+  const existing = await env.CONFIG_KV.get(autoKey, 'json');
+  if (existing?.code) return false;
+  const code = await grantAutoInvite(env, cfg, userId);
+  if (!code) return false;
+  await env.CONFIG_KV.put(autoKey, JSON.stringify({ code, at: Date.now() }));
+  await tgApi(token, 'sendMessage', {
+    chat_id: chatId,
+    text: `🎉 感谢加入！这是你的专属邀请码：\n\n<code>${tgHtmlEsc(code)}</code>\n\n发送 /register 开始注册，注册时输入此邀请码即可。`,
+    parse_mode: 'HTML',
+  });
+  return true;
+}
+
+// Force-join gate for message/callback handlers. Returns true if blocked (gate message shown).
+async function tgForceJoinCheck(env, cfg, chatId, userId, msgId) {
+  if (!cfg.telegram.forceJoin || !(cfg.telegram.forceJoinChats || []).length) return false;
+  const isAdmin = (cfg.telegram.adminTgIds || []).includes(String(userId));
+  if (isAdmin) return false;
+  const result = await checkTgMembership(cfg.telegram.botToken, userId, cfg.telegram.forceJoinChats);
+  if (!result.joined) {
+    await showTgJoinGate(env, cfg, chatId, result.missing, msgId);
+    return true;
+  }
+  if (cfg.telegram.autoInviteOnJoin !== false) {
+    await tgAutoGrantInvite(env, cfg, chatId, userId);
+  }
+  return false;
+}
+
+// Build the flat list of selectable subscriptions across all globals (with remaining counts).
+async function buildTgSkuOptions(cfg) {
+  const options = [];
+  for (const g of (cfg.globals || [])) {
+    let bySkuId = new Map();
+    try {
+      const subscribed = await fetchSubscribedSkus(g, fetch);
+      bySkuId = new Map(subscribed.map(s => [String(s.skuId).toLowerCase(), s]));
+    } catch { /* fail open: still list names without counts */ }
+    const skuMap = g.skuMap || {};
+    for (const name of Object.keys(skuMap)) {
+      const skuId = String(skuMap[name] || '').toLowerCase();
+      const sku = bySkuId.get(skuId);
+      const rem = sku ? remainingFromSubscribedSku(sku) : 0;
+      const used = sku ? Number(sku.consumedUnits ?? 0) : 0;
+      let label = g.label ? `${g.label} · ${name}` : name;
+      if (cfg.skuDisplayMode === 'used') label += `（已注册：${used}）`;
+      else if (cfg.skuDisplayMode !== 'none') label += `（剩余：${rem}）`;
+      options.push({ globalId: g.id, skuName: name, label, remaining: rem });
+    }
+  }
+  options.sort((a, b) => (b.remaining - a.remaining));
+  return options;
+}
+
+function tgBackMarkup(callbackData, text = '◀️ 返回上一步') {
+  return { inline_keyboard: [[{ text, callback_data: callbackData }]] };
+}
+
+async function tgSendOrEdit(token, chatId, msgId, payload) {
+  if (msgId) {
+    return tgApi(token, 'editMessageText', { chat_id: chatId, message_id: msgId, ...payload });
+  }
+  return tgApi(token, 'sendMessage', { chat_id: chatId, ...payload });
+}
+
+function tgSelectedSkuLabel(state) {
+  const opt = (state.options || []).find(o => o.globalId === state.globalId && o.skuName === state.skuName);
+  return opt?.label || state.skuName || '当前订阅';
+}
+
+async function showTgMainMenu(env, cfg, chatId, userId, msgId) {
+  const token = cfg.telegram.botToken;
+  await clearTgState(env, chatId);
+  const isAdmin = (cfg.telegram.adminTgIds || []).includes(String(userId));
+  const lines = [
+    '欢迎使用 Microsoft 365 自助管理 Bot 👋',
+    '',
+    '可用命令：',
+    '/register — 注册新账号',
+    '/myaccounts — 查看并管理我的账号（改密 / 删除）',
+  ];
+  if (cfg.telegram.allowClaim) lines.push('/claim — 认领我在网页注册的旧账号');
+  if (isAdmin) lines.push('/geninvite — 生成邀请码（管理员专用）');
+  lines.push('/cancel — 取消当前操作');
+  await tgSendOrEdit(token, chatId, msgId, { text: lines.join('\n') });
+}
+
+async function showTgSkuPicker(env, cfg, chatId, msgId, userId) {
+  const token = cfg.telegram.botToken;
+  const options = await buildTgSkuOptions(cfg);
+  if (!options.length) {
+    await clearTgState(env, chatId);
+    await tgSendOrEdit(token, chatId, msgId, { text: '暂无可用订阅，请稍后再试或联系管理员。' });
+    return;
+  }
+  await setTgState(env, chatId, { step: 'awaiting_sku', options }, userId);
+  const keyboard = options.map((o, i) => [{ text: o.label, callback_data: `sku:${i}` }]);
+  keyboard.push([{ text: '◀️ 返回主菜单', callback_data: 'nav:home' }]);
+  await tgSendOrEdit(token, chatId, msgId, {
+    text: '欢迎使用 Microsoft 365 自助注册 👋\n请选择要开通的订阅：',
+    reply_markup: { inline_keyboard: keyboard },
+  });
+}
+
+async function showTgInvitePrompt(env, cfg, chatId, state, msgId, userId) {
+  const token = cfg.telegram.botToken;
+  if (!state.globalId || !state.skuName) {
+    await showTgSkuPicker(env, cfg, chatId, msgId, userId);
+    return;
+  }
+  const next = { ...state, step: 'awaiting_invite' };
+  delete next.inviteCode;
+  delete next.username;
+  await setTgState(env, chatId, next, userId);
+  await tgSendOrEdit(token, chatId, msgId, {
+    text: `已选择：${tgSelectedSkuLabel(next)}\n\n请输入邀请码：`,
+    reply_markup: tgBackMarkup('reg:back:sku', '◀️ 返回订阅选择'),
+  });
+}
+
+async function showTgUsernamePrompt(env, cfg, chatId, state, msgId, prefix = '', userId) {
+  const token = cfg.telegram.botToken;
+  if (!state.globalId || !state.skuName) {
+    await showTgSkuPicker(env, cfg, chatId, msgId, userId);
+    return;
+  }
+  const next = { ...state, step: 'awaiting_username' };
+  delete next.username;
+  await setTgState(env, chatId, next, userId);
+  const backData = cfg.telegram.requireInvite ? 'reg:back:invite' : 'reg:back:sku';
+  const backText = cfg.telegram.requireInvite ? '◀️ 返回邀请码输入' : '◀️ 返回订阅选择';
+  await tgSendOrEdit(token, chatId, msgId, {
+    text: `${prefix}已选择：${tgSelectedSkuLabel(next)}\n\n请输入你想要的用户名（仅字母和数字，例如 johnsmith）：`,
+    reply_markup: tgBackMarkup(backData, backText),
+  });
+}
+
+async function showTgPasswordModePrompt(env, cfg, chatId, state, msgId, userId) {
+  const token = cfg.telegram.botToken;
+  if (!state.username) {
+    await showTgUsernamePrompt(env, cfg, chatId, state, msgId, '', userId);
+    return;
+  }
+  const next = { ...state, step: 'awaiting_pwmode' };
+  await setTgState(env, chatId, next, userId);
+  await tgSendOrEdit(token, chatId, msgId, {
+    text: `用户名：${next.username}\n请选择密码方式：`,
+    reply_markup: { inline_keyboard: [
+      [
+        { text: '🎲 自动生成', callback_data: 'pw:auto' },
+        { text: '✏️ 自己设置', callback_data: 'pw:self' },
+      ],
+      [{ text: '◀️ 返回用户名输入', callback_data: 'reg:back:username' }],
+    ] },
+  });
+}
+
+async function showTgRegisterPasswordPrompt(env, cfg, chatId, state, msgId, userId) {
+  const token = cfg.telegram.botToken;
+  const next = { ...state, step: 'awaiting_password' };
+  await setTgState(env, chatId, next, userId);
+  await tgSendOrEdit(token, chatId, msgId, {
+    text: '请输入你想设置的密码（大小写字母/数字/符号任选 3 类，长度 ≥ 8）：',
+    reply_markup: tgBackMarkup('reg:back:pwmode', '◀️ 返回密码方式'),
+  });
+}
+
+async function showTgClaimEmailPrompt(env, cfg, chatId, msgId, userId) {
+  const token = cfg.telegram.botToken;
+  await setTgState(env, chatId, { step: 'claim_email' }, userId);
+  await tgSendOrEdit(token, chatId, msgId, {
+    text: '请输入你要认领的账号邮箱（完整，例如 name@your.onmicrosoft.com）：',
+    reply_markup: tgBackMarkup('nav:home', '◀️ 返回主菜单'),
+  });
+}
+
+async function showTgGenInviteScopePicker(env, cfg, chatId, userId, msgId) {
+  const token = cfg.telegram.botToken;
+  const isAdmin = (cfg.telegram.adminTgIds || []).includes(String(userId));
+  if (!isAdmin) {
+    await clearTgState(env, chatId);
+    await tgSendOrEdit(token, chatId, msgId, { text: '⛔ 此命令仅限管理员使用。' });
+    return;
+  }
+  const options = await buildTgSkuOptions(cfg);
+  if (!options.length) {
+    await clearTgState(env, chatId);
+    await tgSendOrEdit(token, chatId, msgId, { text: '暂无可用的订阅，请先在后台配置全局和 SKU。' });
+    return;
+  }
+  await setTgState(env, chatId, { step: 'geninvite_scope', options }, userId);
+  const buttons = options.map((opt, idx) => [{ text: opt.label, callback_data: `geninvite_scope:${idx}` }]);
+  buttons.push([{ text: '◀️ 返回主菜单', callback_data: 'nav:home' }]);
+  await tgSendOrEdit(token, chatId, msgId, {
+    text: '🎫 生成邀请码\n\n请选择邀请码允许注册的订阅：',
+    reply_markup: { inline_keyboard: buttons }
+  });
+}
+
+async function showTgGenInviteQtyPrompt(env, cfg, chatId, state, msgId, userId) {
+  const token = cfg.telegram.botToken;
+  if (!Array.isArray(state.scopes) || !state.scopes.length) {
+    await showTgGenInviteScopePicker(env, cfg, chatId, userId, msgId);
+    return;
+  }
+  const next = { ...state, step: 'geninvite_qty' };
+  delete next.quantity;
+  await setTgState(env, chatId, next, userId);
+  await tgSendOrEdit(token, chatId, msgId, {
+    text: `✅ 已选择：${tgSelectedSkuLabel(next)}\n\n请输入要生成的邀请码数量（1-100）：`,
+    reply_markup: tgBackMarkup('gen:back:scope', '◀️ 返回订阅选择'),
+  });
+}
+
+async function showTgGenInviteLimitPrompt(env, cfg, chatId, state, msgId, userId) {
+  const token = cfg.telegram.botToken;
+  const next = { ...state, step: 'geninvite_limit' };
+  await setTgState(env, chatId, next, userId);
+  await tgSendOrEdit(token, chatId, msgId, {
+    text: '✅ 数量已设置\n\n请输入每个邀请码的使用次数（1-999）：',
+    reply_markup: tgBackMarkup('gen:back:qty', '◀️ 返回数量输入'),
+  });
+}
+
+// Entry: /start or /register — present the subscription picker.
+async function startTgRegister(env, cfg, chatId, userId) {
+  await showTgSkuPicker(env, cfg, chatId, null, userId);
+}
+
+// Actually create the account and reply with credentials. password=null means auto-generate.
+async function finishTgRegister(env, cfg, chatId, userId, state, password) {
+  const token = cfg.telegram.botToken;
+  const global = (cfg.globals || []).find(g => g.id === state.globalId);
+  if (!global) { await clearTgState(env, chatId); await tgApi(token, 'sendMessage', { chat_id: chatId, text: '会话已过期，请发送 /register 重新开始。' }); return; }
+  const skuId = (global.skuMap || {})[state.skuName];
+  if (!skuId) { await clearTgState(env, chatId); await tgApi(token, 'sendMessage', { chat_id: chatId, text: '订阅无效，请发送 /register 重新开始。' }); return; }
+
+  const lockOwner = userId != null ? `user:${userId}` : `chat:${chatId}`;
+  const opLock = await acquireTgOpLock(env, `register:${lockOwner}`, 180);
+  if (!opLock) {
+    await tgApi(token, 'sendMessage', { chat_id: chatId, text: '当前注册正在处理中，请稍候。' });
+    return;
+  }
+  try {
+  // Per Telegram-user registration limit (bot requests all originate from Telegram's IPs,
+  // so we count by userId rather than IP). This is a CUMULATIVE lifetime counter: it is
+  // never decremented, so deleting an account does NOT free up a registration slot.
+  const limit = cfg.telegram.perUserLimit || 1;
+  const trackKey = KV.TG_TRACK_PREFIX + userId;
+  const usedCount = parseInt(await env.CONFIG_KV.get(trackKey)) || 0;
+  if (userId && usedCount >= limit) {
+    await clearTgState(env, chatId);
+    await tgApi(token, 'sendMessage', { chat_id: chatId, text: `你已达到最大注册次数限制（${limit} 个），无法继续注册。` });
+    return;
+  }
+
+  // Consume the invite BEFORE creating the account, so the used-counter reflects the
+  // reservation immediately (narrows the multi-turn overuse window). Re-validate here
+  // because the code was checked several turns ago and may now be exhausted.
+  if (state.inviteCode) {
+    const recheck = await validateBotInvite(env, state.inviteCode, state.globalId, state.skuName);
+    if (!recheck.ok) {
+      await clearTgState(env, chatId);
+      await tgApi(token, 'sendMessage', { chat_id: chatId, text: `❌ 注册失败：${tgHtmlEsc(recheck.message)}\n发送 /register 重新开始。` });
+      return;
+    }
+    await consumeBotInvite(env, state.inviteCode);
+  }
+
+  const finalPassword = password || generatePassword();
+  let result;
+  try {
+    result = await createM365User(env, cfg, { global, username: state.username, password: finalPassword, skuId });
+  } catch (e) {
+    result = { success: false, message: e?.message || '创建账号失败', status: 500 };
+  }
+  if (!result.success) {
+    // Refund the invite use we reserved above only when no orphaned account remains.
+    if (state.inviteCode && !result.accountMayExist) await refundBotInvite(env, state.inviteCode);
+    await clearTgState(env, chatId);
+    await tgApi(token, 'sendMessage', { chat_id: chatId, text: `❌ 注册失败：${tgHtmlEsc(result.message)}\n发送 /register 重新开始。` });
+    return;
+  }
+
+  if (userId) await env.CONFIG_KV.put(trackKey, (usedCount + 1).toString());
+  // Bind ownership so the user can later manage this account via /myaccounts.
+  await addTgOwned(env, userId, result.email, global.id);
+  await clearTgState(env, chatId);
+
+  const text = `✅ 注册成功！\n\n📧 账号：<code>${tgHtmlEsc(result.email)}</code>\n🔑 密码：<code>${tgHtmlEsc(finalPassword)}</code>\n\n请妥善保存，建议登录后尽快修改密码。\n\n发送 /myaccounts 可管理你名下的账号。`;
+  await tgApi(token, 'sendMessage', { chat_id: chatId, text, parse_mode: 'HTML' });
+  } finally {
+    await releaseTgOpLock(env, opLock);
+  }
+}
+
+// Handle an inline-button press.
+async function handleTgCallback(env, cfg, { chatId, userId, data, msgId }) {
+  const token = cfg.telegram.botToken;
+  // Force-join: "I've joined" re-check button (handled before state check since gate clears state).
+  if (data === 'join:check') {
+    const blocked = await tgForceJoinCheck(env, cfg, chatId, userId, msgId);
+    if (blocked) return;
+    await showTgMainMenu(env, cfg, chatId, userId, msgId);
+    return;
+  }
+  // Force-join gate for all other callbacks (admins bypass).
+  if (await tgForceJoinCheck(env, cfg, chatId, userId, msgId)) return;
+  const state = await getTgState(env, chatId);
+  if (!tgStateBelongsTo(state, userId)) {
+    await rejectTgStateOwnerMismatch(env, cfg, chatId);
+    return;
+  }
+
+  if (data === 'nav:home') {
+    await showTgMainMenu(env, cfg, chatId, userId, msgId);
+    return;
+  }
+
+  if (data === 'reg:back:sku') {
+    await showTgSkuPicker(env, cfg, chatId, msgId, userId);
+    return;
+  }
+  if (data === 'reg:back:invite') {
+    await showTgInvitePrompt(env, cfg, chatId, state, msgId, userId);
+    return;
+  }
+  if (data === 'reg:back:username') {
+    await showTgUsernamePrompt(env, cfg, chatId, state, msgId, '', userId);
+    return;
+  }
+  if (data === 'reg:back:pwmode') {
+    await showTgPasswordModePrompt(env, cfg, chatId, state, msgId, userId);
+    return;
+  }
+
+  if (data === 'claim:back:email') {
+    if (userId) await env.CONFIG_KV.delete(KV.TG_VERIFY_PREFIX + userId);
+    await showTgClaimEmailPrompt(env, cfg, chatId, msgId, userId);
+    return;
+  }
+
+  if (data === 'gen:back:scope') {
+    await showTgGenInviteScopePicker(env, cfg, chatId, userId, msgId);
+    return;
+  }
+  if (data === 'gen:back:qty') {
+    await showTgGenInviteQtyPrompt(env, cfg, chatId, state, msgId, userId);
+    return;
+  }
+
+  // ---- Back to account list ----
+  if (data === 'back_to_list') {
+    const owned = await getTgOwned(env, userId);
+    if (!owned.length) {
+      await tgApi(token, 'editMessageText', {
+        chat_id: chatId, message_id: msgId,
+        text: '你名下已没有账号。\n发送 /register 注册新账号。',
+        reply_markup: tgBackMarkup('nav:home', '◀️ 返回主菜单'),
+      });
+      return;
+    }
+    const kb = owned.map((a, i) => [{ text: a.email, callback_data: `acct:${i}` }]);
+    kb.push([{ text: '◀️ 返回主菜单', callback_data: 'nav:home' }]);
+    await tgApi(token, 'editMessageText', {
+      chat_id: chatId, message_id: msgId,
+      text: '你名下的账号（点击进行管理）：',
+      reply_markup: { inline_keyboard: kb },
+    });
+    return;
+  }
+
+  if (data.startsWith('geninvite_scope:')) {
+    const idx = parseInt(data.slice(16));
+    const opt = (state.options || [])[idx];
+    if (!opt) { await tgApi(token, 'sendMessage', { chat_id: chatId, text: '选项已过期，请重新发送 /geninvite。' }); return; }
+    state.scopes = [{ globalId: opt.globalId, skuName: opt.skuName }];
+    state.globalId = opt.globalId;
+    state.skuName = opt.skuName;
+    await showTgGenInviteQtyPrompt(env, cfg, chatId, state, msgId, userId);
+    return;
+  }
+
+  if (data.startsWith('sku:')) {
+    const idx = parseInt(data.slice(4));
+    const opt = (state.options || [])[idx];
+    if (!opt) { await tgApi(token, 'sendMessage', { chat_id: chatId, text: '选项已过期，请发送 /register 重新开始。' }); return; }
+    state.globalId = opt.globalId;
+    state.skuName = opt.skuName;
+    // If the Bot invite gate is enabled, ask for the invite code before the username.
+    if (cfg.telegram.requireInvite) {
+      await showTgInvitePrompt(env, cfg, chatId, state, msgId, userId);
+      return;
+    }
+    await showTgUsernamePrompt(env, cfg, chatId, state, msgId, '', userId);
+    return;
+  }
+
+  if (data === 'pw:auto' || data === 'pw:self') {
+    if (state.step !== 'awaiting_pwmode') return;
+    if (data === 'pw:auto') {
+      await tgApi(token, 'editMessageText', { chat_id: chatId, message_id: msgId, text: '正在创建账号，请稍候…' });
+      await finishTgRegister(env, cfg, chatId, userId, state, null);
+    } else {
+      await showTgRegisterPasswordPrompt(env, cfg, chatId, state, msgId, userId);
+    }
+    return;
+  }
+
+  // ---- Account management callbacks (data = "acct:<idx>", "pwm:<idx>:<auto|self>", "del:<idx>", "delok:<idx>") ----
+  // <idx> indexes into the user's owned-accounts list, re-read fresh on each action to prevent stale/forged targets.
+  if (data.startsWith('acct:') || data.startsWith('pwm:') || data.startsWith('del:') || data.startsWith('delok:')) {
+    const owned = await getTgOwned(env, userId);
+    const parts = data.split(':');
+    const action = parts[0];
+    const idx = parseInt(parts[1]);
+    const acct = owned[idx];
+    if (!acct) {
+      await tgApi(token, 'editMessageText', { chat_id: chatId, message_id: msgId, text: '账号列表已变化，请重新发送 /myaccounts。' });
+      return;
+    }
+
+    if (action === 'acct') {
+      // Show manage menu for this account.
+      const kb = [
+        [{ text: '🔑 改密', callback_data: `pwm:${idx}` }],
+        [{ text: '🗑 删除', callback_data: `del:${idx}` }],
+        [{ text: '◀️ 返回账号列表', callback_data: 'back_to_list' }],
+      ];
+      await tgApi(token, 'editMessageText', {
+        chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        text: `账号：<code>${tgHtmlEsc(acct.email)}</code>\n请选择操作：`,
+        reply_markup: { inline_keyboard: kb },
+      });
+      return;
+    }
+
+    if (action === 'pwm') {
+      // Choose password mode for reset (respects allowSelfPassword).
+      if (parts[2] === 'auto') {
+        await tgApi(token, 'editMessageText', { chat_id: chatId, message_id: msgId, text: '正在重置密码，请稍候…' });
+        await doTgResetPassword(env, cfg, chatId, userId, acct.email, acct.globalId, null);
+        return;
+      }
+      if (parts[2] === 'self') {
+        await setTgState(env, chatId, { step: 'pwmgmt_password', email: acct.email, globalId: acct.globalId, acctIdx: idx }, userId);
+        await tgApi(token, 'editMessageText', {
+          chat_id: chatId, message_id: msgId,
+          text: '请输入新密码（大小写字母/数字/符号任选 3 类，长度 ≥ 8）：',
+          reply_markup: tgBackMarkup(`pwm:${idx}`, '◀️ 返回改密方式'),
+        });
+        return;
+      }
+      // No explicit mode yet: if self-set is allowed, offer both; otherwise auto-generate directly.
+      if (cfg.telegram.allowSelfPassword) {
+        await tgApi(token, 'editMessageText', {
+          chat_id: chatId, message_id: msgId,
+          text: `为 ${tgHtmlEsc(acct.email)} 重置密码，请选择方式：`, parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [
+            [
+              { text: '🎲 自动生成', callback_data: `pwm:${idx}:auto` },
+              { text: '✏️ 自己设置', callback_data: `pwm:${idx}:self` },
+            ],
+            [{ text: '◀️ 返回', callback_data: `acct:${idx}` }],
+          ] },
+        });
+      } else {
+        await tgApi(token, 'editMessageText', { chat_id: chatId, message_id: msgId, text: '正在重置密码，请稍候…' });
+        await doTgResetPassword(env, cfg, chatId, userId, acct.email, acct.globalId, null);
+      }
+      return;
+    }
+
+    if (action === 'del') {
+      // Ask for confirmation (irreversible).
+      await tgApi(token, 'editMessageText', {
+        chat_id: chatId, message_id: msgId, parse_mode: 'HTML',
+        text: `⚠️ 确认删除账号 <code>${tgHtmlEsc(acct.email)}</code>？\n此操作不可恢复，账号及其订阅将被移除。`,
+        reply_markup: { inline_keyboard: [
+          [{ text: '⚠️ 确认删除', callback_data: `delok:${idx}` }],
+          [{ text: '◀️ 取消并返回', callback_data: `acct:${idx}` }],
+        ] },
+      });
+      return;
+    }
+
+    if (action === 'delok') {
+      await tgApi(token, 'editMessageText', { chat_id: chatId, message_id: msgId, text: '正在删除，请稍候…' });
+      const global = (cfg.globals || []).find(g => g.id === acct.globalId);
+      if (!global) { await tgApi(token, 'sendMessage', { chat_id: chatId, text: '全局配置已变化，无法删除。' }); return; }
+      const opLock = await acquireTgOpLock(env, `delete:${userId}:${(acct.email || '').toLowerCase()}`, 120);
+      if (!opLock) {
+        await tgApi(token, 'sendMessage', { chat_id: chatId, text: '当前删除正在处理中，请稍候。' });
+        return;
+      }
+      try {
+      const res = await graphDeleteUser(env, cfg, global, acct.email);
+      if (!res.success) {
+        await tgApi(token, 'sendMessage', {
+          chat_id: chatId,
+          text: `❌ 删除失败：${tgHtmlEsc(res.message)}`,
+          reply_markup: tgBackMarkup(`acct:${idx}`, '◀️ 返回账号操作'),
+        });
+        return;
+      }
+      await removeTgOwned(env, userId, acct.email, acct.globalId);
+      await tgApi(token, 'sendMessage', {
+        chat_id: chatId,
+        text: `✅ 已删除 ${tgHtmlEsc(acct.email)}。`,
+        parse_mode: 'HTML',
+          reply_markup: tgBackMarkup('back_to_list', '◀️ 返回账号列表'),
+        });
+      } finally {
+        await releaseTgOpLock(env, opLock);
+      }
+      return;
+    }
+  }
+}
+
+// List a TG user's owned accounts as inline buttons.
+async function showTgAccounts(env, cfg, chatId, userId) {
+  const token = cfg.telegram.botToken;
+  const owned = await getTgOwned(env, userId);
+  if (!owned.length) {
+    const hint = cfg.telegram.allowClaim
+      ? '你名下还没有账号。\n发送 /register 注册，或 /claim 认领已有账号。'
+      : '你名下还没有账号。\n发送 /register 注册。';
+    await tgApi(token, 'sendMessage', {
+      chat_id: chatId,
+      text: hint,
+      reply_markup: tgBackMarkup('nav:home', '◀️ 返回主菜单'),
+    });
+    return;
+  }
+  const kb = owned.map((a, i) => [{ text: a.email, callback_data: `acct:${i}` }]);
+  kb.push([{ text: '◀️ 返回主菜单', callback_data: 'nav:home' }]);
+  await tgApi(token, 'sendMessage', {
+    chat_id: chatId,
+    text: '你名下的账号（点击进行管理）：',
+    reply_markup: { inline_keyboard: kb },
+  });
+}
+
+// Reset password for an owned account. password=null means auto-generate.
+// Re-verifies ownership before acting (defends against stale sessions).
+async function doTgResetPassword(env, cfg, chatId, userId, email, globalId, password) {
+  const token = cfg.telegram.botToken;
+  const owned = await getTgOwned(env, userId);
+  const acctIdx = owned.findIndex(x => (x.email || '').toLowerCase() === (email || '').toLowerCase() && x.globalId === globalId);
+  const stillOwned = owned.some(x => (x.email || '').toLowerCase() === (email || '').toLowerCase() && x.globalId === globalId);
+  if (!stillOwned) {
+    await tgApi(token, 'sendMessage', {
+      chat_id: chatId,
+      text: '该账号不在你的名下，操作已取消。',
+      reply_markup: tgBackMarkup('back_to_list', '◀️ 返回账号列表'),
+    });
+    return;
+  }
+  const global = (cfg.globals || []).find(g => g.id === globalId);
+  if (!global) {
+    await tgApi(token, 'sendMessage', {
+      chat_id: chatId,
+      text: '全局配置已变化，无法改密。',
+      reply_markup: tgBackMarkup(acctIdx >= 0 ? `acct:${acctIdx}` : 'back_to_list', acctIdx >= 0 ? '◀️ 返回账号操作' : '◀️ 返回账号列表'),
+    });
+    return;
+  }
+
+  const opLock = await acquireTgOpLock(env, `reset:${userId}:${(email || '').toLowerCase()}`, 120);
+  if (!opLock) {
+    await tgApi(token, 'sendMessage', { chat_id: chatId, text: '当前改密正在处理中，请稍候。' });
+    return;
+  }
+  try {
+  const finalPassword = password || generatePassword();
+  const res = await graphResetPassword(global, email, finalPassword);
+  if (!res.success) {
+    await tgApi(token, 'sendMessage', {
+      chat_id: chatId,
+      text: `❌ 改密失败：${tgHtmlEsc(res.message)}`,
+      reply_markup: tgBackMarkup(acctIdx >= 0 ? `acct:${acctIdx}` : 'back_to_list', acctIdx >= 0 ? '◀️ 返回账号操作' : '◀️ 返回账号列表'),
+    });
+    return;
+  }
+  const text = `✅ 密码已重置\n\n📧 账号：<code>${tgHtmlEsc(email)}</code>\n🔑 新密码：<code>${tgHtmlEsc(finalPassword)}</code>\n\n请妥善保存。`;
+  await tgApi(token, 'sendMessage', {
+    chat_id: chatId,
+    text,
+    parse_mode: 'HTML',
+    reply_markup: tgBackMarkup(acctIdx >= 0 ? `acct:${acctIdx}` : 'back_to_list', acctIdx >= 0 ? '◀️ 返回账号操作' : '◀️ 返回账号列表'),
+  });
+  } finally {
+    await releaseTgOpLock(env, opLock);
+  }
+}
+
+// Handle a text message.
+async function handleTgMessage(env, cfg, { chatId, userId, text, msgId }) {
+  const token = cfg.telegram.botToken;
+
+  // Force-join gate (admins bypass). Blocked users see the join prompt instead.
+  if (await tgForceJoinCheck(env, cfg, chatId, userId, null)) return;
+
+  if (text === '/cancel') {
+    await clearTgState(env, chatId);
+    await tgApi(token, 'sendMessage', { chat_id: chatId, text: '已取消当前操作。发送 /register 重新开始。' });
+    return;
+  }
+  if (text === '/start' || text === '/help') {
+    await showTgMainMenu(env, cfg, chatId, userId, null);
+    return;
+  }
+  if (text === '/register') {
+    return startTgRegister(env, cfg, chatId, userId);
+  }
+  if (text === '/myaccounts') {
+    await clearTgState(env, chatId);
+    return showTgAccounts(env, cfg, chatId, userId);
+  }
+  if (text === '/claim') {
+    if (!cfg.telegram.allowClaim) {
+      await tgApi(token, 'sendMessage', { chat_id: chatId, text: '账号认领功能未开启。' });
+      return;
+    }
+    await showTgClaimEmailPrompt(env, cfg, chatId, null, userId);
+    return;
+  }
+  if (text === '/geninvite') {
+    await clearTgState(env, chatId);
+    await showTgGenInviteScopePicker(env, cfg, chatId, userId, null);
+    return;
+  }
+  if (text === '/cancel') {
+    await clearTgState(env, chatId);
+    await tgApi(token, 'sendMessage', { chat_id: chatId, text: '✅ 已取消当前操作。\n\n发送 /help 查看可用命令。' });
+    return;
+  }
+
+  // 未知命令处理
+  if (text.startsWith('/')) {
+    const isAdmin = (cfg.telegram.adminTgIds || []).includes(String(userId));
+    const lines = [
+      '❓ 未知命令，可用命令：',
+      '',
+      '/start 或 /help — 查看帮助',
+      '/register — 注册新账号',
+      '/myaccounts — 管理我的账号',
+    ];
+    if (cfg.telegram.allowClaim) lines.push('/claim — 认领旧账号');
+    if (isAdmin) lines.push('/geninvite — 生成邀请码（管理员）');
+    lines.push('/cancel — 取消当前操作');
+    await tgApi(token, 'sendMessage', { chat_id: chatId, text: lines.join('\n') });
+    return;
+  }
+
+  const state = await getTgState(env, chatId);
+  if (!tgStateBelongsTo(state, userId)) {
+    await rejectTgStateOwnerMismatch(env, cfg, chatId);
+    return;
+  }
+
+  // ---- Claim flow: awaiting email ----
+  if (state.step === 'claim_email') {
+    const email = text.toLowerCase();
+    if (!/^[^@\s]+@[^@\s]+$/.test(email)) {
+      await tgApi(token, 'sendMessage', {
+        chat_id: chatId,
+        text: '邮箱格式不正确，请重新输入。',
+        reply_markup: tgBackMarkup('nav:home', '◀️ 返回主菜单'),
+      });
+      return;
+    }
+    if (isProtectedUpn(email, env, cfg)) {
+      await clearTgState(env, chatId);
+      await tgApi(token, 'sendMessage', { chat_id: chatId, text: '该账号受保护，无法认领。' });
+      return;
+    }
+    const domain = email.split('@')[1];
+    const global = (cfg.globals || []).find(g => (g.defaultDomain || '').toLowerCase() === domain);
+    if (!global) {
+      await tgApi(token, 'sendMessage', {
+        chat_id: chatId,
+        text: '未找到该邮箱对应的全局/域名，请确认后重试。',
+        reply_markup: tgBackMarkup('nav:home', '◀️ 返回主菜单'),
+      });
+      return;
+    }
+    const user = await graphFindUser(global, email);
+    if (!user?.id) {
+      await tgApi(token, 'sendMessage', {
+        chat_id: chatId,
+        text: '账号不存在，请确认邮箱后重试。',
+        reply_markup: tgBackMarkup('nav:home', '◀️ 返回主菜单'),
+      });
+      return;
+    }
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    const sent = await graphSendClaimCode(cfg, global, email, code);
+    if (!sent.success) {
+      await clearTgState(env, chatId);
+      await tgApi(token, 'sendMessage', { chat_id: chatId, text: `验证码发送失败：${tgHtmlEsc(sent.message)}` });
+      return;
+    }
+    await env.CONFIG_KV.put(KV.TG_VERIFY_PREFIX + userId, JSON.stringify({ email, globalId: global.id, code, attempts: 0 }), { expirationTtl: 600 });
+    await setTgState(env, chatId, { step: 'claim_code', email, globalId: global.id }, userId);
+    await tgApi(token, 'sendMessage', {
+      chat_id: chatId,
+      text: '✅ 验证码已发送到该邮箱（10 分钟内有效）\n\n请输入收到的 6 位验证码：',
+      reply_markup: tgBackMarkup('claim:back:email', '◀️ 返回邮箱输入'),
+    });
+    return;
+  }
+
+  // ---- Claim flow: awaiting code ----
+  if (state.step === 'claim_code') {
+    const raw = await env.CONFIG_KV.get(KV.TG_VERIFY_PREFIX + userId, 'json');
+    if (!raw) {
+      await clearTgState(env, chatId);
+      await tgApi(token, 'sendMessage', {
+        chat_id: chatId,
+        text: '验证码已过期，请发送 /claim 重新开始。',
+        reply_markup: tgBackMarkup('nav:home', '◀️ 返回主菜单'),
+      });
+      return;
+    }
+    if (text.trim() !== raw.code) {
+      // Limit brute-force attempts: invalidate the code after too many wrong tries.
+      const attempts = (parseInt(raw.attempts) || 0) + 1;
+      const MAX_ATTEMPTS = 5;
+      if (attempts >= MAX_ATTEMPTS) {
+        await env.CONFIG_KV.delete(KV.TG_VERIFY_PREFIX + userId);
+        await clearTgState(env, chatId);
+        await tgApi(token, 'sendMessage', {
+          chat_id: chatId,
+          text: '验证码错误次数过多，已作废。请发送 /claim 重新开始。',
+          reply_markup: tgBackMarkup('nav:home', '◀️ 返回主菜单'),
+        });
+        return;
+      }
+      // Persist the incremented counter, preserving the original TTL window is best-effort
+      // (KV lacks TTL-read; re-put with a fresh 10-min window is acceptable here).
+      await env.CONFIG_KV.put(KV.TG_VERIFY_PREFIX + userId, JSON.stringify({ ...raw, attempts }), { expirationTtl: 600 });
+      await tgApi(token, 'sendMessage', {
+        chat_id: chatId,
+        text: `验证码错误，请重新输入（还剩 ${MAX_ATTEMPTS - attempts} 次）。`,
+        reply_markup: tgBackMarkup('claim:back:email', '◀️ 返回邮箱输入'),
+      });
+      return;
+    }
+    await addTgOwned(env, userId, raw.email, raw.globalId);
+    await env.CONFIG_KV.delete(KV.TG_VERIFY_PREFIX + userId);
+    await clearTgState(env, chatId);
+    await tgApi(token, 'sendMessage', { chat_id: chatId, text: `✅ 认领成功！\n<code>${tgHtmlEsc(raw.email)}</code> 已加入你的账号列表。\n发送 /myaccounts 管理。`, parse_mode: 'HTML' });
+    return;
+  }
+
+  // ---- Register flow: awaiting invite code ----
+  if (state.step === 'awaiting_invite') {
+    const code = text.trim();
+    const check = await validateBotInvite(env, code, state.globalId, state.skuName);
+    if (!check.ok) {
+      await tgApi(token, 'sendMessage', {
+        chat_id: chatId,
+        text: `${tgHtmlEsc(check.message)}，请重新输入邀请码。`,
+        reply_markup: tgBackMarkup('reg:back:sku', '◀️ 返回订阅选择'),
+      });
+      return;
+    }
+    state.inviteCode = code;
+    await showTgUsernamePrompt(env, cfg, chatId, state, null, '邀请码有效 ✅\n', userId);
+    return;
+  }
+
+  // ---- Set-password flow: awaiting new password for an owned account ----
+  if (state.step === 'pwmgmt_password') {
+    const password = text;
+    if (!checkPasswordComplexity(password)) {
+      const owned = await getTgOwned(env, userId);
+      const idx = Number.isInteger(state.acctIdx)
+        ? state.acctIdx
+        : owned.findIndex(x => (x.email || '').toLowerCase() === (state.email || '').toLowerCase() && x.globalId === state.globalId);
+      await tgApi(token, 'sendMessage', {
+        chat_id: chatId,
+        text: '密码不符合复杂度要求（大小写字母/数字/符号任选 3 类，长度 ≥ 8），请重新输入。',
+        reply_markup: idx >= 0 ? tgBackMarkup(`pwm:${idx}`, '◀️ 返回改密方式') : tgBackMarkup('back_to_list', '◀️ 返回账号列表'),
+      });
+      return;
+    }
+    if (msgId) await tgApi(token, 'deleteMessage', { chat_id: chatId, message_id: msgId });
+    await doTgResetPassword(env, cfg, chatId, userId, state.email, state.globalId, password);
+    await clearTgState(env, chatId);
+    return;
+  }
+
+  if (state.step === 'awaiting_username') {
+    const username = text;
+    if (!/^[a-zA-Z0-9]+$/.test(username)) {
+      const backData = cfg.telegram.requireInvite ? 'reg:back:invite' : 'reg:back:sku';
+      const backText = cfg.telegram.requireInvite ? '◀️ 返回邀请码输入' : '◀️ 返回订阅选择';
+      await tgApi(token, 'sendMessage', {
+        chat_id: chatId,
+        text: '用户名格式错误：只能包含字母和数字，请重新输入。',
+        reply_markup: tgBackMarkup(backData, backText),
+      });
+      return;
+    }
+    const global = (cfg.globals || []).find(g => g.id === state.globalId);
+    if (!global) { await clearTgState(env, chatId); await tgApi(token, 'sendMessage', { chat_id: chatId, text: '会话已过期，请发送 /register 重新开始。' }); return; }
+    if (isProtectedUpn(`${username}@${global.defaultDomain}`, env, cfg)) {
+      const backData = cfg.telegram.requireInvite ? 'reg:back:invite' : 'reg:back:sku';
+      const backText = cfg.telegram.requireInvite ? '◀️ 返回邀请码输入' : '◀️ 返回订阅选择';
+      await tgApi(token, 'sendMessage', {
+        chat_id: chatId,
+        text: '该用户名被禁止注册，请换一个。',
+        reply_markup: tgBackMarkup(backData, backText),
+      });
+      return;
+    }
+    state.username = username;
+    if (cfg.telegram.allowSelfPassword) {
+      await showTgPasswordModePrompt(env, cfg, chatId, state, null, userId);
+    } else {
+      state.step = 'idle';
+      await setTgState(env, chatId, state, userId);
+      await tgApi(token, 'sendMessage', { chat_id: chatId, text: '正在创建账号，请稍候…' });
+      await finishTgRegister(env, cfg, chatId, userId, state, null);
+    }
+    return;
+  }
+
+  if (state.step === 'awaiting_password') {
+    const password = text;
+    if (password.toLowerCase().includes((state.username || '').toLowerCase())) {
+      await tgApi(token, 'sendMessage', {
+        chat_id: chatId,
+        text: '密码不能包含用户名，请重新输入。',
+        reply_markup: tgBackMarkup('reg:back:pwmode', '◀️ 返回密码方式'),
+      });
+      return;
+    }
+    if (!checkPasswordComplexity(password)) {
+      await tgApi(token, 'sendMessage', {
+        chat_id: chatId,
+        text: '密码不符合复杂度要求（大小写字母/数字/符号任选 3 类，长度 ≥ 8），请重新输入。',
+        reply_markup: tgBackMarkup('reg:back:pwmode', '◀️ 返回密码方式'),
+      });
+      return;
+    }
+    // Best-effort: delete the message containing the plaintext password.
+    if (msgId) await tgApi(token, 'deleteMessage', { chat_id: chatId, message_id: msgId });
+    await tgApi(token, 'sendMessage', { chat_id: chatId, text: '正在创建账号，请稍候…' });
+    await finishTgRegister(env, cfg, chatId, userId, state, password);
+    return;
+  }
+
+  // ---- Generate invite flow: awaiting quantity ----
+  if (state.step === 'geninvite_qty') {
+    const qty = parseInt(text);
+    if (isNaN(qty) || qty < 1 || qty > 100) {
+      await tgApi(token, 'sendMessage', {
+        chat_id: chatId,
+        text: '数量必须是 1-100 之间的整数，请重新输入。',
+        reply_markup: tgBackMarkup('gen:back:scope', '◀️ 返回订阅选择'),
+      });
+      return;
+    }
+    state.quantity = qty;
+    await showTgGenInviteLimitPrompt(env, cfg, chatId, state, null, userId);
+    return;
+  }
+
+  // ---- Generate invite flow: awaiting limit ----
+  if (state.step === 'geninvite_limit') {
+    const limit = parseInt(text);
+    if (isNaN(limit) || limit < 1 || limit > 999) {
+      await tgApi(token, 'sendMessage', {
+        chat_id: chatId,
+        text: '使用次数必须是 1-999 之间的整数，请重新输入。',
+        reply_markup: tgBackMarkup('gen:back:qty', '◀️ 返回数量输入'),
+      });
+      return;
+    }
+    await tgApi(token, 'sendMessage', { chat_id: chatId, text: '⏳ 正在生成邀请码，请稍候…' });
+
+    // 生成邀请码
+    const length = 12;
+    const sets = ['upper', 'lower', 'digit'];
+    const prefix = (cfg.inviteCodePrefix || '').trim();
+    const dict = {
+      upper: 'ABCDEFGHJKLMNPQRSTUVWXYZ',
+      lower: 'abcdefghjkmnpqrstuvwxyz',
+      digit: '23456789',
+    };
+    let pool = '';
+    sets.forEach(s => { if (dict[s]) pool += dict[s]; });
+
+    await ensureInvites(env);
+    const invites = await getInvites(env);
+    const existingCodes = new Set(invites.map(x => x.code));
+    const newCodes = [];
+
+    for (let i = 0; i < state.quantity; i++) {
+      let code = '';
+      let attempts = 0;
+      do {
+        code = '';
+        const randomBytes = new Uint8Array(length);
+        crypto.getRandomValues(randomBytes);
+        for (let j = 0; j < length; j++) {
+          code += pool[randomBytes[j] % pool.length];
+        }
+        code = prefix + code;
+        attempts++;
+        if (attempts > 50) {
+          await tgApi(token, 'sendMessage', { chat_id: chatId, text: '❌ 生成失败：重试次数过多，请稍后再试。' });
+          await clearTgState(env, chatId);
+          return;
+        }
+      } while (existingCodes.has(code));
+
+      existingCodes.add(code);
+      invites.push({ code, limit, used: 0, createdAt: Date.now(), usedAt: null, allowed: state.scopes });
+      newCodes.push(code);
+    }
+
+    await saveInvites(env, invites);
+    await clearTgState(env, chatId);
+
+    // 发送结果
+    const codeList = newCodes.join('\n');
+    await tgApi(token, 'sendMessage', {
+      chat_id: chatId,
+      text: `✅ 成功生成 ${newCodes.length} 个邀请码\n使用次数：${limit}\n\n${codeList}`,
+      parse_mode: 'HTML'
+    });
+    return;
+  }
+
+  // 默认回复：提示用户如何开始
+  const isAdmin = (cfg.telegram.adminTgIds || []).includes(String(userId));
+  const lines = [
+    '👋 你好！',
+    '',
+    '我可以帮你管理 Microsoft 365 账号。',
+    '',
+    '📝 快速开始：',
+    '/register — 注册新账号',
+    '/myaccounts — 管理我的账号',
+  ];
+  if (cfg.telegram.allowClaim) lines.push('/claim — 认领旧账号');
+  if (isAdmin) lines.push('/geninvite — 生成邀请码');
+  lines.push('');
+  lines.push('💡 发送 /help 查看完整命令列表');
+  await tgApi(token, 'sendMessage', { chat_id: chatId, text: lines.join('\n') });
+}
+
+// Dispatch a Telegram update to the right handler.
+async function handleTelegramUpdate(env, cfg, update) {
+  if (!cfg.telegram?.botToken) return;
+  if (update.callback_query) {
+    const cq = update.callback_query;
+    const chat = cq.message?.chat;
+    const chatId = chat?.id;
+    if (chat?.type !== 'private') {
+      await tgApi(cfg.telegram.botToken, 'answerCallbackQuery', { callback_query_id: cq.id, text: '请私聊使用这个 Bot。' });
+      return;
+    }
+    await tgApi(cfg.telegram.botToken, 'answerCallbackQuery', { callback_query_id: cq.id });
+    if (chatId) await handleTgCallback(env, cfg, { chatId, userId: cq.from?.id, data: cq.data || '', msgId: cq.message?.message_id });
+    return;
+  }
+  if (update.message) {
+    const msg = update.message;
+    const chat = msg.chat;
+    const chatId = chat?.id;
+    if (chat?.type !== 'private') return;
+    if (chatId && typeof msg.text === 'string') {
+      await handleTgMessage(env, cfg, { chatId, userId: msg.from?.id, text: msg.text.trim(), msgId: msg.message_id });
+    }
+    return;
+  }
 }
 
 /* -------------------- Request Handler -------------------- */
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     let cfg = await getConfig(env);
     const adminPath = cfg.adminPath || '/admin';
@@ -1854,6 +3297,34 @@ export default {
 
     // redirect to setup if not installed
     if (!installed && !isSetupPath) return redirect(`${adminPath}/setup`);
+
+    /* ---------- Telegram Bot Webhook ---------- */
+    if (url.pathname === '/tg/webhook' && request.method === 'POST') {
+      // Verify request origin using Telegram's secret token header.
+      // Fail closed and stay silent (200) so probers learn nothing.
+      const tg = cfg.telegram || {};
+      if (!tg.enabled || !tg.botToken || !tg.webhookSecret) {
+        return new Response('ok', { status: 200 });
+      }
+      const secret = request.headers.get('X-Telegram-Bot-Api-Secret-Token');
+      if (secret !== tg.webhookSecret) {
+        return new Response('ok', { status: 200 });
+      }
+      const update = await request.json().catch(() => null);
+      if (update) {
+        const updateId = update.update_id;
+        if (updateId != null) {
+          const updateKey = KV.TG_UPDATE_PREFIX + updateId;
+          const seen = await env.CONFIG_KV.get(updateKey);
+          if (seen) return new Response('ok', { status: 200 });
+          await env.CONFIG_KV.put(updateKey, Date.now().toString(), { expirationTtl: 86400 });
+        }
+        const task = handleTelegramUpdate(env, cfg, update).catch((err) => console.error('Telegram update failed', err));
+        if (ctx?.waitUntil) ctx.waitUntil(task);
+        else await task;
+      }
+      return new Response('ok', { status: 200 });
+    }
 
     /* ---------- Setup ---------- */
     if (isSetupPath) {
@@ -1964,6 +3435,7 @@ export default {
           tenantId: body.tenantId || '',
           clientId: body.clientId || '',
           clientSecret: body.clientSecret || '',
+          senderEmail: body.senderEmail || '',
           skuMap: sanitizeSkuMap(body.skuMap)
         };
         cfg.globals = cfg.globals || [];
@@ -1989,6 +3461,7 @@ export default {
           tenantId: body.tenantId || cfg.globals[idx].tenantId,
           clientId: body.clientId || cfg.globals[idx].clientId,
           clientSecret: body.clientSecret || cfg.globals[idx].clientSecret,
+          senderEmail: body.senderEmail !== undefined ? body.senderEmail : cfg.globals[idx].senderEmail,
           skuMap: body.skuMap ? sanitizeSkuMap(body.skuMap) : cfg.globals[idx].skuMap
         };
         await setConfig(env, cfg);
@@ -2055,6 +3528,26 @@ export default {
         };
         cfg.customFooter = body.customFooter || cfg.customFooter;
         if (body.skuDisplayMode) cfg.skuDisplayMode = body.skuDisplayMode;
+        if (body.inviteCodePrefix !== undefined) cfg.inviteCodePrefix = (body.inviteCodePrefix || '').toString().trim();
+
+        // Telegram Bot settings (webhookSecret is managed server-side, not overwritten here)
+        if (body.telegram) {
+          cfg.telegram = {
+            ...(cfg.telegram || {}),
+            enabled: !!body.telegram.enabled,
+            botToken: (body.telegram.botToken || '').toString().trim(),
+            perUserLimit: parseInt(body.telegram.perUserLimit) || 1,
+            allowSelfPassword: body.telegram.allowSelfPassword !== false,
+            requireInvite: !!body.telegram.requireInvite,
+            allowClaim: !!body.telegram.allowClaim,
+            adminTgIds: Array.isArray(body.telegram.adminTgIds) ? body.telegram.adminTgIds.map(id => String(id).trim()).filter(Boolean) : [],
+            forceJoin: !!body.telegram.forceJoin,
+            forceJoinChats: Array.isArray(body.telegram.forceJoinChats) ? body.telegram.forceJoinChats.map(s => String(s).trim()).filter(Boolean) : [],
+            autoInviteOnJoin: body.telegram.autoInviteOnJoin !== false,
+           // senderEmail 已移至租户级配置，保留此字段仅为向后兼容
+          };
+        }
+
         cfg.adminPath = newPath;
 
         cfg = mergeConfig(cfg);
@@ -2188,15 +3681,16 @@ export default {
       if (url.pathname === `${adminPath}/api/invites/generate` && request.method === 'POST') {
         const body = await request.json().catch(() => ({}));
         const sets = body.sets || [];
-        const length = body.length || 16;
-        const qty = body.quantity || 1;
-        const limit = body.limit || 1;
+        const length = Math.min(Math.max(parseInt(body.length) || 16, 6), 32); // 限制 6-32 位
+        const qty = Math.min(parseInt(body.quantity) || 1, 100); // 限制最多 100 个
+        const limit = Math.max(parseInt(body.limit) || 1, 1);
         const scopes = body.scopes || [];
+        const prefix = (cfg.inviteCodePrefix || '').trim(); // 获取前缀
         const dict = {
-          upper: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',
-          lower: 'abcdefghijklmnopqrstuvwxyz',
-          digit: '0123456789',
-          sym: '!@#$%^&*()-_=+[]{}<>?'
+          upper: 'ABCDEFGHJKLMNPQRSTUVWXYZ', // 移除易混淆的 I, O
+          lower: 'abcdefghjkmnpqrstuvwxyz', // 移除易混淆的 i, l, o
+          digit: '23456789', // 移除易混淆的 0, 1
+          sym: '@#$%^&*-_=+'
         };
         let pool = '';
         sets.forEach(s => { if (dict[s]) pool += dict[s]; });
@@ -2204,8 +3698,28 @@ export default {
         if (!scopes.length) return jsonResponse({ success: false, message: '请选择限制范围' }, 400);
         await ensureInvites(env);
         const invites = await getInvites(env);
+        const existingCodes = new Set(invites.map(x => x.code));
+
         for (let i = 0; i < qty; i++) {
-          let code = ''; for (let j = 0; j < length; j++) code += pool[Math.floor(Math.random() * pool.length)];
+          let code = '';
+          let attempts = 0;
+          // 使用 crypto.getRandomValues 生成更安全的随机数
+          do {
+            code = '';
+            const randomBytes = new Uint8Array(length);
+            crypto.getRandomValues(randomBytes);
+            for (let j = 0; j < length; j++) {
+              code += pool[randomBytes[j] % pool.length];
+            }
+            // 添加前缀
+            code = prefix + code;
+            attempts++;
+            if (attempts > 50) {
+              return jsonResponse({ success: false, message: '生成邀请码失败，请减少数量或增加长度' }, 500);
+            }
+          } while (existingCodes.has(code)); // 避免重复
+
+          existingCodes.add(code);
           invites.push({ code, limit, used: 0, createdAt: Date.now(), usedAt: null, allowed: scopes });
         }
         await saveInvites(env, invites);
@@ -2218,6 +3732,53 @@ export default {
         const filtered = invites.filter(c => !codes.includes(c.code));
         await saveInvites(env, filtered);
         return jsonResponse({ success: true, removed: codes.length });
+      }
+
+      // Telegram: one-click set webhook. Generates a fresh secret, registers the
+      // webhook with Telegram pointing at this Worker's /tg/webhook, and persists both.
+      if (url.pathname === `${adminPath}/api/tg/setwebhook` && request.method === 'POST') {
+        const botToken = (cfg.telegram?.botToken || '').trim();
+        if (!botToken) return jsonResponse({ success: false, message: '请先填写并保存 Bot Token' }, 400);
+
+        const secret = crypto.randomUUID().replace(/-/g, '');
+        const webhookUrl = `${url.origin}/tg/webhook`;
+        try {
+          const resp = await fetch(`https://api.telegram.org/bot${botToken}/setWebhook`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              url: webhookUrl,
+              secret_token: secret,
+              allowed_updates: ['message', 'callback_query'],
+              drop_pending_updates: true,
+            }),
+          });
+          const data = await resp.json().catch(() => ({}));
+          if (!data.ok) {
+            return jsonResponse({ success: false, message: 'Telegram 拒绝设置：' + (data.description || '未知错误') }, 400);
+          }
+          cfg.telegram = { ...(cfg.telegram || {}), webhookSecret: secret };
+          cfg = mergeConfig(cfg);
+          await setConfig(env, cfg);
+          return jsonResponse({ success: true, webhookUrl });
+        } catch (e) {
+          return jsonResponse({ success: false, message: '请求 Telegram 失败：' + e.message }, 500);
+        }
+      }
+
+      // Telegram: delete webhook (disable bot reception).
+      if (url.pathname === `${adminPath}/api/tg/deletewebhook` && request.method === 'POST') {
+        const botToken = (cfg.telegram?.botToken || '').trim();
+        if (!botToken) return jsonResponse({ success: false, message: '未配置 Bot Token' }, 400);
+        try {
+          await fetch(`https://api.telegram.org/bot${botToken}/deleteWebhook`, { method: 'POST' });
+          cfg.telegram = { ...(cfg.telegram || {}), webhookSecret: '' };
+          cfg = mergeConfig(cfg);
+          await setConfig(env, cfg);
+          return jsonResponse({ success: true });
+        } catch (e) {
+          return jsonResponse({ success: false, message: '请求 Telegram 失败：' + e.message }, 500);
+        }
       }
     }
 
