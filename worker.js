@@ -2249,9 +2249,13 @@ async function checkTgMembership(token, userId, chats) {
     const status = res?.result?.status;
     if (status === 'member' || status === 'administrator' || status === 'creator') continue;
     let title = parsed.id;
+    let chatType = null;
     const chatRes = await tgApi(token, 'getChat', { chat_id: parsed.id });
-    if (chatRes?.ok && chatRes?.result?.title) title = chatRes.result.title;
-    missing.push({ ...parsed, title });
+    if (chatRes?.ok && chatRes?.result) {
+      if (chatRes.result.title) title = chatRes.result.title;
+      chatType = chatRes.result.type || null;
+    }
+    missing.push({ ...parsed, title, chatType });
   }
   return { joined: missing.length === 0, missing };
 }
@@ -2264,8 +2268,9 @@ async function showTgJoinGate(env, cfg, chatId, missing, msgId) {
   const buttons = [];
   for (const m of missing) {
     const label = m.title || '频道/群组';
-    lines.push(`• ${tgHtmlEsc(label)}`);
-    if (m.url) buttons.push([{ text: `📢 加入 ${label}`, url: m.url }]);
+    const icon = m.chatType === 'channel' ? '📢' : (m.chatType === 'group' || m.chatType === 'supergroup') ? '👥' : '📢';
+    lines.push(`${icon} ${tgHtmlEsc(label)}`);
+    if (m.url) buttons.push([{ text: `${icon} 加入 ${label}`, url: m.url }]);
   }
   lines.push('', '加入后点击下方按钮重新验证：');
   buttons.push([{ text: '✅ 我已加入', callback_data: 'join:check' }]);
