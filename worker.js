@@ -1729,7 +1729,7 @@ document.getElementById('btnSaveSetting').onclick=async()=>{
       allowClaim: document.getElementById('sTgAllowClaim').checked,
       adminTgIds: (document.getElementById('sTgAdminIds').value||'').split(',').map(s=>s.trim()).filter(Boolean),
       forceJoin: document.getElementById('sTgForceJoin').checked,
-      forceJoinChats: (document.getElementById('sTgForceJoinChats').value||'').split(/\r?\n/).map(s=>s.trim()).filter(Boolean),
+      forceJoinChats: (document.getElementById('sTgForceJoinChats').value||'').split(/\\r?\\n/).map(s=>s.trim()).filter(Boolean),
       autoInviteOnJoin: document.getElementById('sTgAutoInvite').checked
     }
   };
