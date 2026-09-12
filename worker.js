@@ -2247,15 +2247,17 @@ async function checkTgMembership(token, userId, chats) {
     if (!parsed.id) { missing.push({ ...parsed, title: '频道/群组' }); continue; }
     const res = await tgApi(token, 'getChatMember', { chat_id: parsed.id, user_id: userId });
     const status = res?.result?.status;
-    if (status === 'member' || status === 'administrator' || status === 'creator') continue;
+    if (status === 'member' || status === 'administrator' || status === 'creator' || status === 'restricted') continue;
     let title = parsed.id;
     let chatType = null;
+    let error = null;
+    if (!res?.ok) error = res?.description || 'Bot 无权查询此频道/群组（请将 Bot 添加为管理员）';
     const chatRes = await tgApi(token, 'getChat', { chat_id: parsed.id });
     if (chatRes?.ok && chatRes?.result) {
       if (chatRes.result.title) title = chatRes.result.title;
       chatType = chatRes.result.type || null;
     }
-    missing.push({ ...parsed, title, chatType });
+    missing.push({ ...parsed, title, chatType, error });
   }
   return { joined: missing.length === 0, missing };
 }
@@ -2270,6 +2272,7 @@ async function showTgJoinGate(env, cfg, chatId, missing, msgId) {
     const label = m.title || '频道/群组';
     const icon = m.chatType === 'channel' ? '📢' : (m.chatType === 'group' || m.chatType === 'supergroup') ? '👥' : '📢';
     lines.push(`${icon} ${tgHtmlEsc(label)}`);
+    if (m.error) lines.push(`    ⚠️ ${tgHtmlEsc(m.error)}`);
     if (m.url) buttons.push([{ text: `${icon} 加入 ${label}`, url: m.url }]);
   }
   lines.push('', '加入后点击下方按钮重新验证：');
